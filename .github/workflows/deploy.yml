@@ -1,0 +1,16 @@
+name: Deploy
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ENTAAI_SSH_HOST }}
+          username: ${{ secrets.ENTAAI_SSH_USER }}
+          key: ${{ secrets.ENTAAI_SSH_KEY }}
+          script: /home/deploy/deploy/deploy_python_ai_agent.sh

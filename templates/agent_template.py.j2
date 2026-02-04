@@ -1,0 +1,4263 @@
+import base64
+import io
+import json
+import os
+import queue
+import re
+import threading
+from datetime import datetime, timedelta
+from typing import Any
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+
+import requests
+from openai import OpenAI
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
+
+from app.config import get_openai_api_key, get_openai_model
+from app.rag import load_vectorstore
+
+AGENT_CONTEXT = json.loads(r'''{{ context | tojson }}''')
+POSTMAN_REQUESTS = AGENT_CONTEXT.get("postman_requests", [])
+POSTMAN_LOGIN = AGENT_CONTEXT.get("postman_login")
+POSTMAN_VARIABLES = AGENT_CONTEXT.get("postman_variables", {})
+SERVICE_ENDPOINT_MAP = AGENT_CONTEXT.get("service_endpoint_map", {})
+INTEGRATIONS = [
+    item
+    for item in (AGENT_CONTEXT.get("integrations", []) or [])
+    if isinstance(item, dict) and item.get("enabled", True)
+]
+RUNTIME_CONTEXT: dict[str, Any] = {}
+LAST_OUTPUT: str | None = None
+
+
+def _runtime_value(key: str, default: Any | None = None) -> Any | None:
+    if not key:
+        return default
+    value = RUNTIME_CONTEXT.get(key)
+    return default if value is None else value
+
+
+def _set_runtime(values: dict[str, Any] | None = None, **kwargs: Any) -> None:
+    if values:
+        RUNTIME_CONTEXT.update(values)
+    if kwargs:
+        RUNTIME_CONTEXT.update(kwargs)
+
+SESSION = requests.Session()
+SESSION_HEADERS: dict[str, str] = {}
+LOGS: list[dict[str, Any]] = []
+LOG_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "data",
+        "{{ device_id }}",
+        "{{ agent_name }}",
+    )
+)
+LOG_PATH = os.path.join(LOG_DIR, "request_logs.jsonl")
+INTEGRATION_LOG_PATH = os.path.join(LOG_DIR, "integration_logs.jsonl")
+ACTION_LOG_PATH = os.path.join(LOG_DIR, "action_logs.jsonl")
+POSTMAN_TIMEOUT = int(os.getenv("POSTMAN_TIMEOUT", "75"))
+INTEGRATION_TIMEOUT = int(os.getenv("INTEGRATION_TIMEOUT", "40"))
+LLM_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "20"))
+LLM_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "6"))
+CONNECTED_INTEGRATIONS: set[str] = set()
+RETURN_DIRECT_TOOLS: set[str] = {"google_calendar_create_event"}
+
+
+def _write_log(entry: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _write_integration_log(entry: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(INTEGRATION_LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _write_action_log(entry: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(ACTION_LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _write_chat_log(entry: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, "chat_logs.jsonl")
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _write_prompt_log(entry: dict[str, Any]) -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, "prompt_logs.jsonl")
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _log_user_prompt(user_input: str, messages: list[dict[str, str]] | None = None) -> None:
+    _write_prompt_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "user_prompt",
+            "device_id": _get_device_id(),
+            "agent": AGENT_CONTEXT.get("name"),
+            "input": user_input,
+            "messages": messages or [],
+            "attachments": _runtime_value("attachments") or [],
+        }
+    )
+
+def _log_assistant_reply(text: str) -> None:
+    _write_chat_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "assistant_reply",
+            "device_id": _get_device_id(),
+            "agent": AGENT_CONTEXT.get("name"),
+            "output": text,
+        }
+    )
+def _format_context() -> str:
+    parts = [
+        "You are an API orchestration agent.",
+        "Use RAG to answer with context from uploaded files and Postman collections.",
+        "If calling HTTP endpoints, summarize intent before calling the tool.",
+        "Stay on the user's requested service until completed; do not switch tasks mid-flow.",
+        "If Postman endpoints are available, use them and always login first.",
+        "If the user attached files, use them only when the user explicitly asks. For image requests that mention a specific attachment, pass its URL as image_url.",
+        "If a brand profile is configured, use the brand logo and colors by default for image generation unless the user asks not to.",
+        "When presenting booking data, output plain lines only: each line starts with '- ' and uses 'Label: Value' (no bullets, no bold, no markdown headings).",
+        "Group lines by ordering: Booking fields, Guest fields, Stay fields, Charges fields. Avoid long line-item dumps unless asked.",
+        "If an API response is JSON, summarize key fields and offer to show full JSON on request.",
+        "For option selections, accept either a numeric index or an exact name match. If a name doesn't match, ask again.",
+        "If the user gives natural language dates like 'today', 'tomorrow', or 'now', ask them to provide explicit YYYY-MM-DD dates.",
+        "For any list or prompt, output each option on its own line in the format: '- Option N: Value'.",
+        "Do not invent data for steps backed by integrations. Use Postman endpoints described by the flow.",
+        "Follow the flow order: after presenting options, wait for a selection, then call the next relevant endpoint if configured.",
+        "If any Postman call fails, respond with the HTTP status and offer to show logs via get_request_logs.",
+        "Never rewrite user-provided dates; pass the exact YYYY-MM-DD values the user gives.",
+        "For general questions (like hotel info or policies), always call rag_search first and answer using its results.",
+        "For Update Booking, require the booking number from the user and replace it in the endpoint path.",
+        "For Get Reservation, require the booking number from the user and pass it as the 'search' query param.",
+        "When updating a booking, only include fields the user explicitly provides in their latest request. Do not reuse earlier dates.",
+        "Once the user confirms a booking number, reuse that booking number for subsequent update steps without re-asking.",
+        "If integrations are configured, use the integration tools to perform actions instead of saying no endpoint exists.",
+        "For calendar requests, create events with google_calendar_create_event. For sheets, use google_sheets_get_values or google_sheets_append_values. For drive, use google_drive_list_files. For gmail, use google_gmail_send.",
+        "For image generation requests, use nano_banan_image_generate if available; otherwise use gemini_image_generate.",
+        "For messaging, use telegram_send_message, whatsapp_send_message, whatsapp_send_file, or messenger_send_message.",
+        "If the user says \"send to me\" or \"my phone\" and WhatsApp is available, send the message to the WhatsApp owner phone from integration credentials. Do not ask for their phone number unless the owner phone is missing.",
+        "If the user asks to send marketing content to WhatsApp and images are requested, do this order: send the text first with whatsapp_send_message, then send a short 'images are generating' notice, then generate 1 image (gemini_image_generate count=1), then send it via whatsapp_send_file. Do not display image URLs to the user; reply with a short confirmation only.",
+        "If an integration tool succeeds, confirm success and summarize the result. Only mention timeouts when a tool returns an explicit timeout error.",
+        "If a service requires integrations or a knowledge base but none are configured, proceed with realistic dummy data and clearly label it as placeholder data.",
+        "For greetings and acknowledgments, avoid the phrase 'how can I help you today' and use varied coworker-style responses instead.",
+        "Always reply in the user's language and dialect. If they use Egyptian Arabic, respond in Egyptian Arabic; if they use Gulf Arabic, respond in Gulf Arabic; if they use English, respond in English.",
+        "",
+        "Description:",
+        AGENT_CONTEXT.get("description", ""),
+        "",
+        "Services:",
+        AGENT_CONTEXT.get("services", ""),
+        "",
+        "Flow:",
+        AGENT_CONTEXT.get("flow", ""),
+        "",
+    ]
+    integrations = INTEGRATIONS
+    if integrations:
+        parts.append("Integrations:")
+        for item in integrations:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("id") or "integration"
+            requirements = item.get("requirements") or ""
+            behavior = item.get("behavior") or ""
+            flow_steps = item.get("flow_steps") or ""
+            creds = item.get("credentials") if isinstance(item.get("credentials"), dict) else {}
+            parts.append(f"- {name}")
+            if requirements:
+                parts.append(f"  Requirements: {requirements}")
+            if flow_steps:
+                parts.append(f"  Flow steps: {flow_steps}")
+            if behavior:
+                parts.append(f"  Behavior: {behavior}")
+            if item.get("id") == "whatsapp":
+                owner_phone = None
+                if isinstance(creds, dict):
+                    owner_phone = (
+                        creds.get("owner_phone")
+                        or creds.get("owner_number")
+                        or creds.get("owner_phone_number")
+                    )
+                parts.append(f"  Owner phone configured: {'yes' if owner_phone else 'no'}")
+        parts.append("")
+    postman_summary = AGENT_CONTEXT.get("postman_summary", "")
+    if postman_summary:
+        parts.extend(["Postman Collection:", postman_summary, ""])
+    brand_profile = AGENT_CONTEXT.get("brand_profile") or {}
+    if isinstance(brand_profile, dict) and (brand_profile.get("logo_url") or brand_profile.get("colors")):
+        parts.append("Brand profile:")
+        if brand_profile.get("logo_url"):
+            parts.append(f"- Logo: {brand_profile.get('logo_url')}")
+        colors = brand_profile.get("colors") or []
+        if isinstance(colors, list) and colors:
+            parts.append(f"- Colors: {', '.join([str(color) for color in colors])}")
+        parts.append("Use brand logo/colors in images unless the user asks to exclude branding.")
+    if SERVICE_ENDPOINT_MAP:
+        parts.append("Service to Endpoint Map:")
+        for service, endpoints in SERVICE_ENDPOINT_MAP.items():
+            if endpoints:
+                parts.append(f"- {service}: {', '.join(endpoints)}")
+    parts.append("")
+    return "\n".join(parts)
+
+
+def _language_instruction(text: str) -> str:
+    llm = _selection_llm()
+    if llm is None:
+        if _is_arabic_text(text):
+            return "Respond ONLY in Arabic. Do not switch to English."
+        return "Respond ONLY in English. Do not switch to Arabic."
+    system_prompt = (
+        "Detect the language of the user's message. "
+        "Return JSON: {\"language\": \"arabic\" or \"english\", "
+        "\"instruction\": \"instruction for responding in that language\"}."
+    )
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=text or ""),
+        ])
+    except Exception:
+        if _is_arabic_text(text):
+            return "Respond ONLY in Arabic. Do not switch to English."
+        return "Respond ONLY in English. Do not switch to Arabic."
+    parsed = _parse_json_object(getattr(response, "content", "") or "")
+    if isinstance(parsed, dict):
+        instruction = str(parsed.get("instruction") or "").strip()
+        if instruction:
+            return instruction
+        language = str(parsed.get("language") or "").lower()
+        if language == "arabic":
+            return "Respond ONLY in Arabic. Do not switch to English."
+        if language == "english":
+            return "Respond ONLY in English. Do not switch to Arabic."
+    if _is_arabic_text(text):
+        return "Respond ONLY in Arabic. Do not switch to English."
+    return "Respond ONLY in English. Do not switch to Arabic."
+
+
+def _system_prompt_for_user_input(user_input: str, base: str | None = None) -> str:
+    base_prompt = base or _format_context()
+    language_instruction = _language_instruction(user_input or "")
+    selection_instruction = (
+        "\n\nCRITICAL INSTRUCTION FOR OPTION SELECTION:\n"
+        "When the user selects an option from a list you just showed them:\n"
+        "1. DO NOT show the same list again\n"
+        "2. DO NOT ask them to select again\n"
+        "3. Immediately proceed to the NEXT step in the flow\n"
+        "4. Use the selected value to call the appropriate next endpoint\n"
+        "5. Keep the flow generic and do not assume a specific domain"
+    )
+    combined = base_prompt
+    if language_instruction and language_instruction not in combined:
+        combined = f"{combined}\n\n{language_instruction}".strip()
+    if selection_instruction and selection_instruction not in combined:
+        combined = f"{combined}\n\n{selection_instruction}".strip()
+    return combined
+
+def _integration_base_url() -> str:
+    base = os.getenv("ASSISTANT_API_BASE", "")
+    if not base:
+        base = _runtime_value("api_base") or ""
+    base = str(base).strip()
+    if not base:
+        return ""
+    return base.rstrip("/")
+
+
+def _integration_headers() -> dict[str, str]:
+    token = _runtime_value("auth_token") or os.getenv("ASSISTANT_API_TOKEN", "")
+    token = str(token).strip()
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _attachment_items() -> list[dict[str, Any]]:
+    items = _runtime_value("attachments") or []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _normalize_url(value: str | None) -> str | None:
+    if value in (None, ""):
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    return value.replace("\\/", "/").replace("\\", "")
+
+
+def _latest_image_attachment() -> dict[str, Any] | None:
+    items = _attachment_items()
+    for item in reversed(items):
+        mime = str(item.get("mime_type") or "").lower()
+        url = _normalize_url(item.get("url") or item.get("image_url"))
+        if mime.startswith("image/"):
+            return item
+        if url and re.search(r"\.(png|jpe?g|webp|gif)(\?.*)?$", str(url), re.IGNORECASE):
+            return item
+    return None
+
+def _is_image_analysis_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    if any(
+        phrase in lowered
+        for phrase in [
+            "analyze image",
+            "analyze the image",
+            "analyze this image",
+            "inspect image",
+            "inspect the image",
+            "describe image",
+            "describe the image",
+            "what is in the image",
+            "what's in the image",
+            "what is in this image",
+            "what does this image show",
+        ]
+    ):
+        return True
+    return any(
+        phrase in lowered
+        for phrase in [
+            "حلل الصورة",
+            "تحليل الصورة",
+            "تدقيق الصورة",
+            "افحص الصورة",
+            "صف الصورة",
+            "ماذا في الصورة",
+            "ماذا يوجد في الصورة",
+            "ما محتوى الصورة",
+        ]
+    )
+
+def _extract_image_analysis_from_messages(messages: list[dict[str, str]] | None) -> str:
+    if not messages:
+        return ""
+    for item in messages:
+        if item.get("role") != "system":
+            continue
+        content = (item.get("content") or "").strip()
+        if "Image analysis:" not in content:
+            continue
+        parts = content.split("Image analysis:", 1)
+        analysis = parts[1].strip() if len(parts) > 1 else ""
+        if analysis:
+            return analysis
+    return ""
+
+
+def _get_device_id() -> str | int | None:
+    value = _runtime_value("device_id") or AGENT_CONTEXT.get("device_id")
+    if value in (None, ""):
+        return None
+    return value
+
+
+def _integration_request(
+    method: str,
+    path: str,
+    json_body: dict | None = None,
+    params: dict | None = None,
+) -> str:
+    base = _integration_base_url()
+    if not base:
+        return "Integration API base URL is not configured."
+    headers = _integration_headers()
+    if not headers:
+        return "Missing auth token for integration API."
+    url = base + (path if path.startswith("/") else f"/{path}")
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "method": method,
+        "url": url,
+        "params": params,
+        "json_body": json_body,
+    }
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            json=json_body,
+            timeout=INTEGRATION_TIMEOUT,
+        )
+    except Exception as exc:
+        log_entry["status"] = "error"
+        log_entry["error"] = str(exc)
+        _write_integration_log(log_entry)
+        return f"Status: error\n{exc}"
+    log_entry["status"] = response.status_code
+    log_entry["response"] = response.text[:4000]
+    _write_integration_log(log_entry)
+    content_type = response.headers.get("Content-Type", "")
+    if "application/json" in content_type:
+        try:
+            return json.dumps(response.json(), indent=2)
+        except ValueError:
+            pass
+    return f"Status: {response.status_code}\n{response.text}"
+
+
+def _integration_upload(
+    path: str,
+    data: dict | None = None,
+    files: dict | None = None,
+) -> dict[str, Any] | None:
+    base = _integration_base_url()
+    if not base:
+        return None
+    headers = _integration_headers()
+    if not headers:
+        return None
+    url = base + (path if path.startswith("/") else f"/{path}")
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "method": "POST",
+        "url": url,
+        "data": data,
+        "files": list(files.keys()) if isinstance(files, dict) else None,
+    }
+    try:
+        resp = requests.post(
+            url=url,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=INTEGRATION_TIMEOUT,
+        )
+    except Exception as exc:
+        log_entry["status"] = "error"
+        log_entry["error"] = str(exc)
+        _write_integration_log(log_entry)
+        return None
+    log_entry["status"] = resp.status_code
+    log_entry["response"] = resp.text[:4000]
+    _write_integration_log(log_entry)
+    if "application/json" in resp.headers.get("Content-Type", ""):
+        try:
+            payload = resp.json()
+            return payload if isinstance(payload, dict) else None
+        except ValueError:
+            return None
+    return None
+
+
+def _has_balance(minimum: float = 0.01) -> bool:
+    raw = _integration_request("GET", "/tokens/balance")
+    payload = _parse_json_response(raw)
+    if not payload:
+        return False
+    balance = payload.get("balance_sar")
+    if balance is None and isinstance(payload.get("data"), dict):
+        balance = payload["data"].get("balance_sar")
+    try:
+        return float(balance or 0) >= minimum
+    except Exception:
+        return False
+
+
+def _extract_data_url(data_url: str) -> tuple[str, bytes] | None:
+    if not data_url:
+        return None
+    match = re.match(r"^data:(image/[^;]+);base64,(.+)$", data_url.strip(), flags=re.I | re.S)
+    if not match:
+        return None
+    mime = match.group(1)
+    b64 = match.group(2)
+    try:
+        return mime, base64.b64decode(b64)
+    except Exception:
+        return None
+
+
+def _upload_generated_image(data_url: str) -> str | None:
+    device_id = _get_device_id()
+    if not device_id:
+        return None
+    parsed = _extract_data_url(data_url)
+    if not parsed:
+        return None
+    mime, raw = parsed
+    ext = "png"
+    if "jpeg" in mime:
+        ext = "jpg"
+    elif "webp" in mime:
+        ext = "webp"
+    filename = f"generated-{int(datetime.utcnow().timestamp())}.{ext}"
+    files = {"files": (filename, io.BytesIO(raw), mime)}
+    payload = {"device_id": str(device_id)}
+    resp = _integration_upload("/chat-attachments", data=payload, files=files)
+    if not isinstance(resp, dict):
+        return None
+    attachments = resp.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        url = attachments[0].get("url")
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
+def _parse_json_response(raw: str) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_postman_payload(raw: str) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if text.lower().startswith("status:"):
+        parts = text.split("\n", 1)
+        if len(parts) > 1:
+            text = parts[1].strip()
+    return _parse_json_response(text)
+
+
+def _extract_bearer_token(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("access_token"),
+        payload.get("token"),
+        payload.get("jwt"),
+        payload.get("id_token"),
+    ]
+    token_type = payload.get("token_type") or payload.get("type")
+    nested = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    if nested:
+        candidates.extend(
+            [
+                nested.get("access_token"),
+                nested.get("token"),
+                nested.get("jwt"),
+                nested.get("id_token"),
+            ]
+        )
+        if not token_type:
+            token_type = nested.get("token_type") or nested.get("type")
+    nested = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    if nested:
+        candidates.extend(
+            [
+                nested.get("access_token"),
+                nested.get("token"),
+                nested.get("jwt"),
+                nested.get("id_token"),
+            ]
+        )
+        if not token_type:
+            token_type = nested.get("token_type") or nested.get("type")
+    for token in candidates:
+        if isinstance(token, str) and token.strip():
+            token = token.strip()
+            if token.lower().startswith("bearer "):
+                return token
+            return f"Bearer {token}"
+    if isinstance(token_type, str) and token_type.strip():
+        token_type = token_type.strip()
+        if token_type.lower() == "bearer":
+            return None
+    return None
+
+
+_SELECTION_LLM: ChatOpenAI | None = None
+
+
+def _selection_llm() -> ChatOpenAI | None:
+    global _SELECTION_LLM
+    if _SELECTION_LLM is not None:
+        return _SELECTION_LLM
+    api_key = get_openai_api_key()
+    if not api_key:
+        return None
+    _SELECTION_LLM = ChatOpenAI(
+        api_key=api_key,
+        model=get_openai_model(),
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    return _SELECTION_LLM
+
+
+def _serialize_messages(messages: list[dict[str, str]] | None, limit: int = 6) -> list[dict[str, str]]:
+    if not messages:
+        return []
+    trimmed: list[dict[str, str]] = []
+    for item in messages[-limit:]:
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        trimmed.append({"role": role or "user", "content": content})
+    return trimmed
+
+
+def _llm_select_endpoint(
+    requests: list[dict[str, Any]],
+    user_input: str,
+    messages: list[dict[str, str]] | None = None,
+    flow_text: str | None = None,
+    allow_methods: set[str] | None = None,
+    purpose: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(requests, list) or not requests:
+        return None
+    llm = _selection_llm()
+    if llm is None:
+        return None
+    endpoints = []
+    for req in requests:
+        if not isinstance(req, dict):
+            continue
+        method = str(req.get("method", "GET")).upper()
+        if allow_methods and method not in allow_methods:
+            continue
+        endpoints.append(
+            {
+                "name": str(req.get("name") or ""),
+                "method": method,
+                "url": str(req.get("url") or ""),
+                "description": str(req.get("description") or ""),
+            }
+        )
+    if not endpoints:
+        return None
+    system_prompt = (
+        "Select the best API endpoint to call now based on the input and context. "
+        "Never select authentication/login/token endpoints; login is handled automatically. "
+        "If the user is selecting from options, avoid endpoints that require identifiers or search parameters "
+        "that are not present in the user input or recent messages. "
+        "Return JSON with a single key 'endpoint' whose value is the exact endpoint name, "
+        "or 'NONE' if no endpoint should be called."
+    )
+    payload = {
+        "purpose": purpose or "auto_select",
+        "user_input": user_input,
+        "flow": (flow_text or "").strip(),
+        "recent_messages": _serialize_messages(messages),
+        "endpoints": endpoints,
+    }
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+    except Exception:
+        return None
+    content = str(getattr(response, "content", "") or "")
+    cleaned_content = content.strip()
+    if cleaned_content.startswith("```"):
+        cleaned_content = re.sub(r"^```(?:json)?\\s*", "", cleaned_content, flags=re.I)
+        cleaned_content = re.sub(r"\\s*```$", "", cleaned_content)
+        cleaned_content = cleaned_content.strip()
+    endpoint_name = ""
+    try:
+        parsed = json.loads(cleaned_content)
+        if isinstance(parsed, dict):
+            endpoint_name = str(parsed.get("endpoint") or "").strip()
+    except Exception:
+        endpoint_name = cleaned_content.strip() if cleaned_content else content.strip()
+    if not endpoint_name or endpoint_name.lower() == "none":
+        return None
+    for req in requests:
+        if not isinstance(req, dict):
+            continue
+        name = str(req.get("name") or "")
+        if name and name.lower() == endpoint_name.lower():
+            return req
+    return None
+
+
+def _resolve_selection_index_llm(options: list[str], user_input: str) -> int | None:
+    if not options or not user_input:
+        return None
+    llm = _selection_llm()
+    if llm is None:
+        return None
+    options_text = "\n".join([f"{idx + 1}. {opt}" for idx, opt in enumerate(options)])
+    system_prompt = (
+        "Return only the 1-based index of the selected option. "
+        "If the selection is unclear, return 0."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Options:\n{options_text}\nUser input: {user_input}"),
+            ]
+        )
+    except Exception:
+        return None
+    content = str(getattr(response, "content", "") or "")
+    match = re.search(r"\d+", content)
+    if not match:
+        return None
+    idx = int(match.group(0)) - 1
+    if 0 <= idx < len(options):
+        return idx
+    return None
+
+
+def _llm_is_option_selection(options: list[str], user_input: str) -> bool:
+    if not options or not user_input:
+        return False
+    idx = _resolve_selection_index_llm(options, user_input)
+    return idx is not None
+
+
+def _llm_is_greeting(user_input: str) -> bool:
+    cleaned = (user_input or "").strip()
+    if not cleaned:
+        return False
+    llm = _selection_llm()
+    if llm is None:
+        return False
+    system_prompt = (
+        "Determine if the user message is a greeting or small talk. "
+        "Reply ONLY with 'yes' or 'no'."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=cleaned),
+            ]
+        )
+    except Exception:
+        return False
+    content = str(getattr(response, "content", "") or "").strip().lower()
+    return "yes" in content
+
+
+def _llm_missing_flow_fields(
+    messages: list[dict[str, str]] | None,
+    flow_text: str,
+    service_name: str,
+) -> str:
+    llm = _selection_llm()
+    if llm is None:
+        return ""
+    history = messages or []
+    history_text = "\n".join(
+        [
+            f"{item.get('role', 'user')}: {item.get('content', '')}"
+            for item in history[-8:]
+            if isinstance(item, dict)
+        ]
+    )
+    system_prompt = (
+        "Based on the flow steps and the recent conversation, determine if any required "
+        "user inputs are missing before calling the next API. "
+        "Return JSON: {\"missing\": [\"field1\", \"field2\"], \"question\": \"...\"}. "
+        "If nothing is missing, return {\"missing\": [], \"question\": \"\"}."
+    )
+    payload = {
+        "service": service_name,
+        "flow": (flow_text or "").strip(),
+        "recent": history_text,
+    }
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+    except Exception:
+        return ""
+    parsed = _parse_json_object(getattr(response, "content", "") or "")
+    if not isinstance(parsed, dict):
+        return ""
+    missing = parsed.get("missing") or []
+    question = str(parsed.get("question") or "").strip()
+    if missing and question:
+        return question
+    return ""
+
+
+def _format_postman_list(payload: dict[str, Any] | None, user_input: str) -> str:
+    if not payload or not isinstance(payload, dict):
+        return ""
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return ""
+    items = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("title") or item.get("label")
+        if name:
+            items.append(str(name))
+    if not items:
+        return ""
+    if _is_arabic_text(user_input):
+        header = "النتائج المتاحة:"
+        footer = "من فضلك اختر الخيار المناسب."
+    else:
+        header = "Available options:"
+        footer = "Please choose the option you prefer."
+    lines = [header]
+    for idx, name in enumerate(items, start=1):
+        lines.append(f"- Option {idx}: {name}")
+    lines.append(footer)
+    return "\n".join(lines).strip()
+
+
+def _is_services_query(text: str, services_raw: str | None = None, flow_text: str | None = None) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    services = []
+    if isinstance(services_raw, str) and services_raw:
+        services = [part.strip() for part in re.split(r"[\\n,;]+", services_raw) if part.strip()]
+    llm = _selection_llm()
+    if llm is None:
+        return False
+    system_prompt = (
+        "Determine whether the user is asking for a list of services/capabilities "
+        "versus requesting a specific task. Reply only with 'services' or 'task'."
+    )
+    context = (flow_text or "").strip()
+    services_block = "\n".join([f"- {item}" for item in services]) if services else ""
+    user_text = f"Flow:\n{context}\n\nServices:\n{services_block}\n\nUser:\n{cleaned}"
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_text),
+            ]
+        )
+    except Exception:
+        return False
+    content = str(getattr(response, "content", "") or "")
+    return "service" in content.lower()
+
+
+def _auto_postman_get(
+    user_input: str,
+    messages: list[dict[str, str]] | None = None,
+    flow_text: str | None = None,
+) -> str:
+    if not POSTMAN_REQUESTS:
+        return ""
+    llm = _selection_llm()
+    if llm is None:
+        return ""
+    system_prompt = (
+        "Decide if we should call a GET endpoint now to list options or fetch data. "
+        "Return ONLY 'yes' or 'no'. Reply 'no' for greetings, small talk, or high-level intents "
+        "unless the user explicitly asked to list options or the assistant just asked them to choose an option."
+    )
+    history = messages or []
+    history_text = "\\n".join(
+        [
+            f"{item.get('role', 'user')}: {item.get('content', '')}"
+            for item in history[-6:]
+            if isinstance(item, dict)
+        ]
+    )
+    flow_hint = (flow_text or "").strip()
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Flow:\n{flow_hint}\n\nRecent:\n{history_text}\n\nUser: {user_input}"),
+            ]
+        )
+    except Exception:
+        return ""
+    verdict = str(getattr(response, "content", "") or "").strip().lower()
+    if "yes" not in verdict:
+        return ""
+    endpoint = _llm_select_endpoint(
+        POSTMAN_REQUESTS,
+        user_input,
+        messages=messages,
+        flow_text=flow_text,
+        allow_methods={"GET"},
+        purpose="auto_get",
+    )
+    if not endpoint:
+        return ""
+    endpoint_name = str(endpoint.get("name") or "")
+    endpoint_url = str(endpoint.get("url") or "")
+    raw = postman_call(endpoint_name)
+    payload = _parse_postman_payload(raw)
+    formatted = _format_postman_list(payload, user_input)
+    if formatted:
+        _set_runtime(last_options_endpoint=endpoint_name, last_options_url=endpoint_url)
+        # Embed endpoint metadata so future requests can recover last options endpoint
+        response_with_metadata = (
+            f"{formatted}\n\n"
+            f"[Last options endpoint: {endpoint_name}]"
+        )
+        return response_with_metadata
+    return raw
+
+
+def _has_date_like(text: str) -> bool:
+    value = (text or "")
+    if value:
+        value = value.translate(
+            str.maketrans(
+                "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+                "01234567890123456789",
+            )
+        )
+    if re.search(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", value):
+        return True
+    if re.search(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", value):
+        return True
+    lowered = value.lower()
+    month = (
+        r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?|"
+        r"يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|"
+        r"سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)"
+    )
+    if re.search(rf"\b{month}\s+\d{{1,2}}(?:,?\s+\d{{2,4}})?\b", lowered):
+        return True
+    if re.search(rf"\b\d{{1,2}}\s+{month}(?:\s+\d{{2,4}})?\b", lowered):
+        return True
+    return False
+
+
+def _history_has_date_like(messages: list[dict[str, str]] | None) -> bool:
+    if not messages:
+        return False
+    for item in reversed(messages):
+        role = ""
+        content = ""
+        if isinstance(item, dict):
+            role = str(item.get("role") or "").strip().lower()
+            content = str(item.get("content") or "")
+        else:
+            role = str(getattr(item, "type", "") or getattr(item, "role", "") or "").strip().lower()
+            content = str(getattr(item, "content", "") or "")
+        if role != "user":
+            continue
+        if content and _has_date_like(content):
+            return True
+    return False
+
+ 
+
+
+def _auto_postman_from_flow(messages: list[dict[str, str]] | None, user_input: str) -> str:
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    if not flow_text:
+        flow_text = str(_runtime_value("flow") or "")
+    services_raw = AGENT_CONTEXT.get("services") or _runtime_value("services")
+    if _is_services_query(user_input, services_raw, flow_text):
+        return ""
+    llm = _selection_llm()
+    if llm is None:
+        return ""
+    system_prompt = (
+        "Decide if we should call a GET endpoint from the flow right now. "
+        "Return ONLY 'yes' or 'no'. Reply 'no' if required info is missing. "
+        "Follow the agent's flow steps and only advance when earlier steps are satisfied."
+    )
+    history = messages or []
+    history_text = "\n".join(
+        [
+            f"{item.get('role', 'user')}: {item.get('content', '')}"
+            for item in history[-6:]
+            if isinstance(item, dict)
+        ]
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Flow:\n{flow_text}\n\nRecent:\n{history_text}\n\nUser: {user_input}"),
+            ]
+        )
+    except Exception:
+        return ""
+    verdict = str(getattr(response, "content", "") or "").strip().lower()
+    if "yes" not in verdict:
+        return ""
+    endpoint = _llm_select_endpoint(
+        POSTMAN_REQUESTS,
+        user_input,
+        messages=messages,
+        flow_text=flow_text,
+        allow_methods={"GET"},
+        purpose="flow_get",
+    )
+    if not endpoint:
+        return ""
+    endpoint_name = str(endpoint.get("name") or "")
+    endpoint_url = str(endpoint.get("url") or "")
+    raw = postman_call(endpoint_name)
+    payload = _parse_postman_payload(raw)
+    formatted = _format_postman_list(payload, user_input)
+    if formatted:
+        _set_runtime(last_options_endpoint=endpoint_name, last_options_url=endpoint_url)
+        response_with_metadata = (
+            f"{formatted}\n\n"
+            f"[Last options endpoint: {endpoint_name}]"
+        )
+        return response_with_metadata
+    return raw
+
+
+def _extract_last_options(messages: list[dict[str, str]] | None) -> list[str]:
+    if not messages:
+        return []
+    for item in reversed(messages):
+        role = ""
+        content = ""
+        if isinstance(item, dict):
+            role = str(item.get("role") or "").strip().lower()
+            content = str(item.get("content") or "")
+        else:
+            role = str(getattr(item, "type", "") or getattr(item, "role", "") or "").strip().lower()
+            content = str(getattr(item, "content", "") or "")
+        if role != "assistant":
+            continue
+        if not content:
+            continue
+        llm = _selection_llm()
+        if llm is None:
+            return []
+        try:
+            system_prompt = (
+                "Extract selectable option values from the assistant message. "
+                "If the options are shown like '- Option 1: RMSK', return ['RMSK'] (no 'Option 1:' prefix). "
+                "Return ONLY JSON array of strings. If none, return []."
+            )
+            response = llm.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=content),
+                ]
+            )
+            raw = str(getattr(response, "content", "") or "").strip()
+            parsed = json.loads(raw) if raw.startswith("[") else []
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            return []
+        return []
+    return []
+
+
+def _find_last_options_context(messages: list[dict[str, str]] | None) -> tuple[list[str], str, str]:
+    if not messages:
+        return ([], "", "")
+    assistant_messages: list[str] = []
+    for item in messages:
+        role = ""
+        content = ""
+        if isinstance(item, dict):
+            role = str(item.get("role") or "").strip().lower()
+            content = str(item.get("content") or "")
+        else:
+            role = str(getattr(item, "type", "") or getattr(item, "role", "") or "").strip().lower()
+            content = str(getattr(item, "content", "") or "")
+        if role == "assistant" and content:
+            assistant_messages.append(content)
+    if not assistant_messages:
+        return ([], "", "")
+    options_list: list[str] = []
+    options_text = ""
+    options_index = None
+    for idx in range(len(assistant_messages) - 1, -1, -1):
+        content = assistant_messages[idx]
+        llm = _selection_llm()
+        options = []
+        if llm is not None:
+            try:
+                system_prompt = (
+                    "Extract selectable option values from the assistant message. "
+                    "If the options are shown like '- Option 1: RMSK', return ['RMSK'] (no 'Option 1:' prefix). "
+                    "Return ONLY JSON array of strings. If none, return []."
+                )
+                response = llm.invoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=content),
+                    ]
+                )
+                raw = str(getattr(response, "content", "") or "").strip()
+                parsed = json.loads(raw) if raw.startswith("[") else []
+                if isinstance(parsed, list):
+                    options = [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                options = []
+        if options:
+            options_list = options
+            options_text = content
+            options_index = idx
+            break
+    if options_index is None:
+        return ([], "", "")
+    context_text = ""
+    if options_index > 0:
+        context_text = assistant_messages[options_index - 1]
+    return (options_list, options_text, context_text)
+
+def _options_look_like_fields(options: list[str], context_text: str | None = None) -> bool:
+    if not options:
+        return False
+    code_like = 0
+    for opt in options:
+        token = str(opt or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,12}", token):
+            code_like += 1
+    if code_like >= max(2, len(options) // 2):
+        return False
+    llm = _selection_llm()
+    if llm is None:
+        return False
+    options_text = "\n".join([f"- {opt}" for opt in options])
+    context = (context_text or "").strip()
+    system_prompt = (
+        "Classify whether the ITEMS are form fields the user should fill or selectable choices. "
+        "Prioritize the item list itself; only return 'fields' if the items look like input labels "
+        "(e.g., name, email, phone, date). If the items look like codes, categories, or option values, "
+        "return 'choices'. If unsure, return 'choices'. Reply only with 'fields' or 'choices'."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"Context (optional):\n{context}\n\nItems:\n{options_text}"),
+            ]
+        )
+    except Exception:
+        return False
+    content = str(getattr(response, "content", "") or "")
+    return "field" in content.lower()
+
+
+def _options_are_services(options: list[str]) -> bool:
+    if not options:
+        return False
+    services_raw = AGENT_CONTEXT.get("services")
+    if not services_raw:
+        services_raw = _runtime_value("services")
+    services = []
+    if isinstance(services_raw, str):
+        services = [part.strip() for part in re.split(r"[\\n,;]+", services_raw) if part.strip()]
+    services_lower = {s.lower() for s in services}
+    if not services_lower:
+        return False
+    return all(opt.strip().lower() in services_lower for opt in options)
+
+
+def _selection_index_from_text(text: str) -> int | None:
+    cleaned = (text or "").strip().lower()
+    if not cleaned:
+        return None
+    if _has_date_like(cleaned):
+        return None
+    if cleaned.isdigit():
+        return int(cleaned) - 1
+    match = re.search(r"\d+", cleaned)
+    if match:
+        return int(match.group(0)) - 1
+    return None
+
+
+def _select_option_value(options: list[str], user_input: str) -> str:
+    """Use LLM to intelligently match user input to options."""
+    if not options or not user_input:
+        return ""
+    idx = _selection_index_from_text(user_input)
+    if idx is not None and 0 <= idx < len(options):
+        return options[idx]
+    cleaned = user_input.strip().lower()
+    if cleaned:
+        for opt in options:
+            if cleaned == opt.lower():
+                return opt
+        for opt in options:
+            if cleaned in opt.lower():
+                return opt
+    llm = _selection_llm()
+    if llm is None:
+        return ""
+    system_prompt = (
+        "The user is selecting from a list of options. "
+        "Return ONLY the exact option text they selected, or empty string if unclear. "
+        "Handle selections by number (1, 2, etc.), by name, or by description. "
+        "Support both English and Arabic input."
+    )
+    options_text = "\\n".join([f"{idx + 1}. {opt}" for idx, opt in enumerate(options)])
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Options:\\n{options_text}\\n\\nUser said: {user_input}\\n\\nSelected option:"),
+        ])
+    except Exception:
+        return ""
+    result = str(getattr(response, "content", "") or "").strip()
+    if not result:
+        return ""
+    for opt in options:
+        if result.lower() == opt.lower() or result in opt or opt in result:
+            return opt
+    return ""
+
+
+def _parse_query_placeholders(url: str) -> list[str]:
+    if not url or "?" not in url:
+        return []
+    query = url.split("?", 1)[1]
+    params = []
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        if "=" in pair:
+            key, _ = pair.split("=", 1)
+        else:
+            key = pair
+        key = key.strip()
+        if not key:
+            continue
+        params.append(key)
+    return params
+
+
+def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, selected: str) -> str | None:
+    if not keys:
+        return None
+    # Never pick system/config parameters for user selections
+    system_params = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    selectable_keys = [k for k in keys if str(k).strip().lower() not in system_params]
+
+    if not selectable_keys:
+        return None
+
+    llm = _selection_llm()
+    if llm is None:
+        # If no LLM, just use the first non-system key if available
+        return selectable_keys[0] if selectable_keys else None
+
+    system_prompt = (
+        "Choose which query parameter should receive the selected value. "
+        "NEVER choose 'db', 'token', 'auth', 'api_key', 'key', 'lang', 'locale', 'device', or 'device_id'. "
+        "Prefer keys that represent the user's selection. "
+        "Reply only with the parameter key, or 'none' if unsure."
+    )
+    user_text = (
+        f"Endpoint: {endpoint_name}\nFlow: {flow_text}\n"
+        f"Keys: {', '.join(selectable_keys)}\nSelected: {selected}"
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_text),
+            ]
+        )
+    except Exception:
+        return selectable_keys[0] if selectable_keys else None
+    content = str(getattr(response, "content", "") or "")
+    choice = content.strip().split()[0] if content else ""
+    if choice in selectable_keys:
+        return choice
+    return selectable_keys[0] if selectable_keys else None
+
+
+def _fallback_query_key(keys: list[str]) -> str | None:
+    if not keys:
+        return None
+    if len(keys) == 1:
+        return keys[0]
+    ignore = {
+        "db",
+        "device_id",
+        "device",
+        "token",
+        "auth",
+        "api_key",
+        "key",
+        "lang",
+        "locale",
+    }
+    candidates = [key for key in keys if key.strip().lower() not in ignore]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, selected: str) -> dict[str, str] | None:
+    keys = _parse_query_placeholders(url)
+    if not keys or not selected:
+        return None
+    key = _pick_query_param_key(keys, endpoint_name, flow_text, selected)
+    # Never allow selection values to be mapped into ignored/system keys like db
+    ignored_keys = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    if key and str(key).strip().lower() in ignored_keys:
+        key = None
+    if not key:
+        key = _fallback_query_key(keys)
+    if not key:
+        return None
+    return {key: selected}
+
+
+def _extract_last_endpoint_from_history(messages: list[dict[str, str]] | None) -> str:
+    """Extract the last endpoint name that was called to produce options, from message history."""
+    if not messages:
+        return ""
+    # Look for endpoint hints in assistant/system messages
+    for item in reversed(messages):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "")
+        if "last options endpoint" in content.lower() or "last endpoint" in content.lower():
+            for line in content.split("\n"):
+                if "last options endpoint" in line.lower() or "last endpoint" in line.lower():
+                    parts = line.split(":", 1)
+                    if len(parts) > 1:
+                        endpoint = parts[1].strip()
+                        if endpoint and endpoint.lower() not in ("", "none", "(if any)"):
+                            return endpoint
+    return ""
+
+
+def _maybe_followup_from_selection(messages: list[dict[str, str]] | None, user_input: str) -> str:
+    if not user_input or not messages or not POSTMAN_REQUESTS:
+        return ""
+    options, options_text, context_message = _find_last_options_context(messages)
+    if not options:
+        return ""
+    if _options_look_like_fields(options, context_message):
+        return ""
+    if _options_are_services(options):
+        return ""
+    matched_option = _select_option_value(options, user_input)
+    if not matched_option:
+        return ""
+    _write_action_log({
+        "timestamp": datetime.utcnow().isoformat(),
+        "event": "option_selected",
+        "options": options,
+        "user_input": user_input,
+        "selected": matched_option,
+    })
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    last_options_endpoint = str(_runtime_value("last_options_endpoint") or "").strip()
+    selection_context = (
+        f"IMPORTANT: User just selected '{matched_option}' from the available options.\\n"
+        f"The available options were: {', '.join(options)}\\n"
+        f"DO NOT call the same endpoint that produced these options.\\n"
+        f"Last options endpoint (if any): {last_options_endpoint}\\n"
+        f"Proceed to the NEXT step in the flow.\\n"
+        f"User input was: {user_input}\\n"
+        f"Selected value: {matched_option}"
+    )
+    endpoint = _llm_select_endpoint(
+        POSTMAN_REQUESTS,
+        selection_context,
+        messages=messages,
+        flow_text=flow_text,
+        allow_methods={"GET", "POST"},
+        purpose="selection_followup",
+    )
+    endpoint_name = str(endpoint.get("name") or "") if endpoint else ""
+    endpoint_url = str(endpoint.get("url") or "") if endpoint else ""
+    if last_options_endpoint and endpoint_name and endpoint_name.lower() == last_options_endpoint.lower():
+        endpoint = None
+        endpoint_name = ""
+        endpoint_url = ""
+    query = _build_query_for_selection(endpoint_url, endpoint_name, flow_text, matched_option) if endpoint else None
+    if not query:
+        for req in POSTMAN_REQUESTS:
+            name = str(req.get("name") or "")
+            url = str(req.get("url") or "")
+            candidate_query = _build_query_for_selection(url, name, flow_text, matched_option)
+            if candidate_query:
+                endpoint = req
+                endpoint_name = name
+                endpoint_url = url
+                query = candidate_query
+                break
+    if not endpoint:
+        return ""
+    try:
+        raw = postman_call.invoke({"endpoint_name": endpoint_name, "query": query})
+    except Exception as exc:
+        _write_action_log({
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "endpoint_call_failed",
+            "endpoint": endpoint_name,
+            "error": str(exc),
+        })
+        return f"Error calling {endpoint_name}: {exc}"
+    payload = _parse_postman_payload(raw)
+    formatted = _format_postman_list(payload, user_input)
+    if formatted:
+        _set_runtime(last_options_endpoint=endpoint_name, last_options_url=endpoint_url)
+    return formatted or raw
+
+
+def _iter_integrations() -> list[dict[str, Any]]:
+    if not isinstance(INTEGRATIONS, list):
+        return []
+    return [item for item in INTEGRATIONS if isinstance(item, dict)]
+
+
+def _find_integration(integration_id: str) -> dict[str, Any] | None:
+    for item in _iter_integrations():
+        if item.get("id") == integration_id:
+            return item
+    return None
+
+
+def _tool_name(tool: Any) -> str:
+    name = getattr(tool, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    name = getattr(tool, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return tool.__class__.__name__
+
+
+def _integration_credentials(integration_id: str) -> dict[str, Any]:
+    integration = _find_integration(integration_id)
+    creds = integration.get("credentials") if integration else {}
+    return creds if isinstance(creds, dict) else {}
+
+
+def _integration_ids() -> set[str]:
+    ids: set[str] = set()
+    for item in _iter_integrations():
+        value = str(item.get("id") or "").strip()
+        if value:
+            ids.add(value)
+    return ids
+
+
+def _integration_tools() -> list[Any]:
+    ids = _integration_ids()
+    tools: list[Any] = []
+    if "whatsapp" in ids:
+        tools.extend([whatsapp_send_message, whatsapp_send_file])
+    if "telegram" in ids:
+        tools.append(telegram_send_message)
+    if "gemini-image" in ids:
+        tools.append(gemini_image_generate)
+    if "nano-banan-pro" in ids:
+        tools.append(nano_banan_image_generate)
+    if "google-calendar" in ids:
+        tools.extend([google_calendar_list_calendars, google_calendar_list_events, google_calendar_create_event])
+    if "google-sheets" in ids:
+        tools.extend([google_sheets_get_values, google_sheets_append_values])
+    if "google-drive" in ids:
+        tools.append(google_drive_list_files)
+    if "google-gmail" in ids:
+        tools.append(google_gmail_send)
+    if "meta-messenger" in ids or "meta_messenger" in ids:
+        tools.append(messenger_send_message)
+    return tools
+
+def _brand_profile() -> dict[str, Any]:
+    profile = AGENT_CONTEXT.get("brand_profile") or {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def _should_skip_branding(prompt: str) -> bool:
+    if not prompt:
+        return False
+    lowered = prompt.lower()
+    keywords = [
+        "without logo",
+        "no logo",
+        "do not use logo",
+        "don't use logo",
+        "without branding",
+        "no branding",
+        "without brand",
+        "بدون شعار",
+        "بدون العلامة",
+        "لا تستخدم الشعار",
+        "بدون الهوية",
+        "بدون ألوان",
+        "لا تستخدم الألوان",
+    ]
+    return any(key in lowered for key in keywords)
+
+
+def _ensure_google_connected(service: str, integration_id: str) -> None:
+    creds = _integration_credentials(integration_id)
+    if not creds:
+        return
+    device_id = _get_device_id()
+    if not device_id:
+        return
+    cache_key = f"{device_id}:{integration_id}"
+    if cache_key in CONNECTED_INTEGRATIONS:
+        return
+    payload: dict[str, Any] = {"device_id": device_id}
+    service_json = creds.get("service_account_json")
+    if isinstance(service_json, dict):
+        service_json = json.dumps(service_json)
+    if service_json:
+        payload["service_account_json"] = service_json
+    if "impersonate_email" in creds:
+        payload["impersonate"] = creds.get("impersonate_email") or ""
+    if creds.get("scopes"):
+        payload["scopes"] = creds.get("scopes")
+    if len(payload) > 1:
+        _integration_request("POST", f"/integrations/google/{service}/connect", json_body=payload)
+        CONNECTED_INTEGRATIONS.add(cache_key)
+
+
+def _google_calendar_default_id() -> str:
+    creds = _integration_credentials("google-calendar")
+    if not creds:
+        return "primary"
+    calendar_id = creds.get("calendar_id") if isinstance(creds, dict) else None
+    if isinstance(calendar_id, str) and calendar_id.strip():
+        return calendar_id.strip()
+    return "primary"
+
+
+def _ensure_telegram_connected() -> None:
+    creds = _integration_credentials("telegram")
+    if not creds:
+        return
+    device_id = _get_device_id()
+    if not device_id or not creds.get("bot_token"):
+        return
+    cache_key = f"{device_id}:telegram"
+    if cache_key in CONNECTED_INTEGRATIONS:
+        return
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "bot_token": creds.get("bot_token"),
+        "set_webhook": True,
+    }
+    if creds.get("webhook_url"):
+        payload["webhook_url"] = creds.get("webhook_url")
+    _integration_request("POST", "/integrations/telegram/connect", json_body=payload)
+    CONNECTED_INTEGRATIONS.add(cache_key)
+
+
+def _ensure_whatsapp_connected() -> None:
+    creds = _integration_credentials("whatsapp")
+    if not creds:
+        return
+    device_id = _get_device_id()
+    if not device_id or not creds.get("client_id") or not creds.get("token"):
+        return
+    cache_key = f"{device_id}:whatsapp"
+    if cache_key in CONNECTED_INTEGRATIONS:
+        return
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "client_id": creds.get("client_id"),
+        "token": creds.get("token"),
+    }
+    if creds.get("webhook_url"):
+        payload["webhook_url"] = creds.get("webhook_url")
+    if isinstance(creds.get("receive_messages"), bool):
+        payload["receive_messages"] = creds.get("receive_messages")
+    if creds.get("chat_type"):
+        payload["chat_type"] = creds.get("chat_type")
+    _integration_request("POST", "/integrations/whatsapp/connect", json_body=payload)
+    CONNECTED_INTEGRATIONS.add(cache_key)
+
+
+def _whatsapp_owner_phone() -> str | None:
+    creds = _integration_credentials("whatsapp")
+    if not creds:
+        return None
+    value = creds.get("owner_phone") or creds.get("owner_number") or creds.get("owner_phone_number")
+    if value in (None, ""):
+        return None
+    value = str(value).strip()
+    return value if value else None
+
+
+def _needs_owner_phone_hint(intent_context: str) -> bool:
+    if not intent_context:
+        return False
+    if not _whatsapp_owner_phone():
+        return False
+    return _wants_whatsapp_delivery(intent_context)
+
+
+def _owner_phone_hint() -> SystemMessage | None:
+    if not _whatsapp_owner_phone():
+        return None
+    return SystemMessage(
+        content=(
+            "WhatsApp owner phone is configured. If the user says 'send to me' or 'my phone', "
+            "do not ask for their number. Use whatsapp_send_message without a 'to' value to send "
+            "to the owner phone."
+        )
+    )
+
+
+_INTENT_CACHE: dict[str, dict[str, bool]] = {}
+
+
+def _text_contains_design_terms(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "design",
+        "poster",
+        "flyer",
+        "banner",
+        "branding",
+        "logo",
+        "graphic",
+        "social post",
+        "booth",
+        "brochure",
+        "تصميم",
+        "بوستر",
+        "ملصق",
+        "بنر",
+        "شعار",
+        "جرافيك",
+        "هوية",
+        "براند",
+        "تسويق",
+        "سوشيال",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _design_enabled() -> bool:
+    if AGENT_CONTEXT.get("disable_design") is True:
+        return False
+    if AGENT_CONTEXT.get("enable_design") is True:
+        return True
+    services = str(AGENT_CONTEXT.get("services", "") or "").lower()
+    description = str(AGENT_CONTEXT.get("description", "") or "").lower()
+    return _text_contains_design_terms(f"{services}\n{description}")
+
+
+def _design_allowed(intent_context: str) -> bool:
+    return _design_enabled()
+
+
+def _classify_intent(intent_context: str) -> dict[str, Any]:
+    if not intent_context:
+        return {
+            "send_to_whatsapp": False,
+            "generate_images": False,
+            "wants_marketing": False,
+            "avoid_whatsapp": False,
+            "needs_design_details": False,
+            "followup_question": "",
+            "needs_brand_choice": False,
+            "use_brand_logo": True,
+            "use_brand_colors": True,
+        }
+    if not _design_enabled():
+        return {
+            "send_to_whatsapp": False,
+            "generate_images": False,
+            "wants_marketing": False,
+            "avoid_whatsapp": False,
+            "needs_design_details": False,
+            "followup_question": "",
+            "needs_brand_choice": False,
+            "use_brand_logo": True,
+            "use_brand_colors": True,
+        }
+    cached = _INTENT_CACHE.get(intent_context)
+    if cached:
+        return cached
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    system_prompt = (
+        "Classify the user's intent for a hotel assistant. Consider implicit requests and any language. "
+        "Return ONLY valid JSON with keys: "
+        "send_to_whatsapp (true only if the user explicitly asks to send/deliver/forward to WhatsApp or phone), "
+        "generate_images (true if the user wants images/designs/visuals), "
+        "wants_marketing (true if the request is for marketing or social media content), "
+        "avoid_whatsapp (true if the user wants the response only in this chat or says not to send), "
+        "needs_design_details (true if the user requests a design but the request is vague), "
+        "followup_question (a single short question asking for missing details, empty if not needed), "
+        "needs_brand_choice (true if you should ask whether to use brand logo/colors), "
+        "use_brand_logo (true if the user explicitly wants to use the brand logo), "
+        "use_brand_colors (true if the user explicitly wants to use brand colors). "
+        "Rules: send_to_whatsapp should be true only when the user clearly requests sending to their phone or WhatsApp. "
+        "If avoid_whatsapp is true, send_to_whatsapp must be false. "
+        "If needs_design_details is true, send_to_whatsapp must be false. "
+        "needs_design_details should be true when the user asks for a design but omits key info like "
+        "design type, occasion, main message text, or style. "
+        "needs_brand_choice should be true when the user requests a design and a brand profile exists but the user "
+        "did not say whether to use the brand logo/colors. "
+        "If the user says 'use the logo' or 'use brand colors', set the matching flag true. "
+        "If the user says 'do not use logo/colors/branding', set the matching flag false. "
+        "If the user is answering a follow-up question about a previously requested design "
+        "(e.g., branding preference, colors, or style), keep generate_images true even if the "
+        "current message doesn't explicitly mention images. "
+        "Examples: 'send it to my number' => send_to_whatsapp true. "
+        "'ارسلها على رقمي' => send_to_whatsapp true. "
+        "'صمم بوست' => generate_images true and needs_design_details true. "
+        "'صمم بوست لعرض الجمعة النص كذا' => generate_images true and needs_design_details false."
+    )
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=intent_context)])
+    content = getattr(response, "content", "")
+    intent = {
+        "send_to_whatsapp": False,
+        "generate_images": False,
+        "wants_marketing": False,
+        "avoid_whatsapp": False,
+        "needs_design_details": False,
+        "followup_question": "",
+        "needs_brand_choice": False,
+        "use_brand_logo": True,
+        "use_brand_colors": True,
+    }
+    parsed = _parse_json_object(content)
+    brand_decision = False
+    if isinstance(parsed, dict):
+        brand_decision = any(
+            key in parsed for key in ("use_brand_logo", "use_brand_colors", "needs_brand_choice")
+        )
+        intent = {
+            "send_to_whatsapp": bool(parsed.get("send_to_whatsapp")),
+            "generate_images": bool(parsed.get("generate_images")),
+            "wants_marketing": bool(parsed.get("wants_marketing")),
+            "avoid_whatsapp": bool(parsed.get("avoid_whatsapp")),
+            "needs_design_details": bool(parsed.get("needs_design_details")),
+            "followup_question": str(parsed.get("followup_question") or "").strip(),
+            "needs_brand_choice": bool(parsed.get("needs_brand_choice")),
+            "use_brand_logo": parsed.get("use_brand_logo", True) is not False,
+            "use_brand_colors": parsed.get("use_brand_colors", True) is not False,
+        }
+    if intent.get("avoid_whatsapp") or intent.get("needs_design_details"):
+        intent["send_to_whatsapp"] = False
+    if intent.get("wants_marketing") and not intent.get("generate_images"):
+        intent["generate_images"] = True
+    if intent.get("generate_images") and _has_brand_profile() and not _should_skip_branding(intent_context):
+        if not intent.get("needs_brand_choice") and not brand_decision:
+            intent["needs_brand_choice"] = True
+            intent["use_brand_logo"] = False
+            intent["use_brand_colors"] = False
+    if not _design_allowed(intent_context):
+        intent["generate_images"] = False
+        intent["wants_marketing"] = False
+        intent["needs_design_details"] = False
+        intent["needs_brand_choice"] = False
+        intent["followup_question"] = ""
+    if _has_brand_profile() and not intent.get("needs_brand_choice"):
+        if (intent.get("use_brand_logo") is False or intent.get("use_brand_colors") is False) and not _should_skip_branding(intent_context):
+            intent["use_brand_logo"] = True
+            intent["use_brand_colors"] = True
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "intent_classified",
+            "context": intent_context,
+            "raw": content if isinstance(content, str) else str(content),
+            "intent": intent,
+        }
+    )
+    _INTENT_CACHE[intent_context] = intent
+    return intent
+
+
+def _parse_json_object(text: Any) -> dict[str, Any] | None:
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*", "", raw).strip()
+        raw = raw.rstrip("`").strip()
+    match = re.search(r"\{.*\}", raw, flags=re.S)
+    if not match:
+        return None
+    snippet = match.group(0)
+    try:
+        parsed = json.loads(snippet)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _wants_whatsapp_delivery(intent_context: str) -> bool:
+    intent = _classify_intent(intent_context)
+    if intent.get("avoid_whatsapp"):
+        return False
+    return intent.get("send_to_whatsapp", False)
+
+
+def _extract_image_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    urls = re.findall(r"https?://\S+\.(?:png|jpe?g|webp|gif)(?:\?\S+)?", text, flags=re.I)
+    data_urls = re.findall(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+", text)
+    return urls + data_urls
+
+def _recent_image_urls(messages: list[dict[str, str]] | None, limit: int = 3) -> list[str]:
+    if not messages:
+        return []
+    for item in reversed(messages):
+        if item.get("role") != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        if not content:
+            continue
+        urls = _extract_image_urls(content)
+        if urls:
+            return urls[:limit]
+    return []
+
+
+def _strip_image_lines(text: str, urls: list[str]) -> str:
+    if not text or not urls:
+        return text.strip()
+    lines = text.splitlines()
+    kept: list[str] = []
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped.lower().startswith("images generated"):
+            continue
+        if line_stripped.lower().startswith("here are"):
+            continue
+        if any(url in line for url in urls):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+def _last_assistant_text(messages: list[dict[str, str]] | None) -> str:
+    if not messages:
+        return ""
+    for item in reversed(messages):
+        if item.get("role") == "assistant":
+            return str(item.get("content") or "")
+    return ""
+
+def _style_options_from_context() -> list[str]:
+    options: list[str] = []
+    for source in (
+        str(AGENT_CONTEXT.get("description") or ""),
+        str(AGENT_CONTEXT.get("flow") or ""),
+    ):
+        for line in source.splitlines():
+            line = line.strip()
+            match = re.match(r"(?:-\s*)?\d+\.\s*(.+)", line)
+            if match:
+                label = match.group(1).strip()
+                if label and label not in options:
+                    options.append(label)
+    return options
+
+def _style_choice_question() -> str:
+    options = _style_options_from_context()
+    if not options:
+        return "Which visual style do you prefer for the image?"
+    lines = ["Please choose a visual style from the options below:"]
+    for idx, label in enumerate(options, start=1):
+        lines.append(f"{idx}. {label}")
+    return "\n".join(lines)
+
+def _style_selected(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    text = (user_input or "").lower()
+    if _is_option_selection(text):
+        return True
+    options = [opt.lower() for opt in _style_options_from_context()]
+    if any(opt and opt in text for opt in options):
+        return True
+    return _llm_style_selected([], user_input)
+
+def _branding_prompted(messages: list[dict[str, str]] | None) -> bool:
+    last = _last_assistant_text(messages).lower()
+    if not last:
+        return False
+    tokens = [
+        "logo",
+        "brand",
+        "branding",
+        "color",
+        "colors",
+        "identity",
+        "الشعار",
+        "الهوية",
+        "اللون",
+        "الألوان",
+        "براند",
+    ]
+    return any(token in last for token in tokens)
+
+def _llm_style_selected(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    if not messages:
+        return False
+    if not user_input:
+        return False
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    last_assistant = _last_assistant_message(messages)
+    system_prompt = (
+        "Decide if the user has confirmed or selected a visual style for an image. "
+        "Return ONLY JSON: {\"selected\": true/false}. "
+        "Treat confirmations like 'use the same style' or implicit confirmations as selected."
+    )
+    response = llm.invoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=f"Assistant asked: {last_assistant}\nUser response: {user_input}"
+            ),
+        ]
+    )
+    parsed = _parse_json_object(getattr(response, "content", ""))
+    return bool(parsed.get("selected")) if isinstance(parsed, dict) else False
+
+def _llm_send_requested(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    if not user_input:
+        return False
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    last_assistant = _last_assistant_message(messages)
+    system_prompt = (
+        "Decide if the user is requesting delivery via WhatsApp or phone. "
+        "Return ONLY JSON: {\"send\": true/false}. "
+        "Treat confirmations and requests to send/deliver/forward to phone/WhatsApp as send=true."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(
+                    content=f"Assistant asked: {last_assistant}\nUser response: {user_input}"
+                ),
+            ]
+        )
+    except Exception as exc:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "llm_send_requested_error",
+                "error": str(exc),
+            }
+        )
+        return False
+    content = getattr(response, "content", "")
+    parsed = _parse_json_object(content)
+    result = bool(parsed.get("send")) if isinstance(parsed, dict) else False
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "llm_send_requested",
+            "last_assistant": last_assistant,
+            "user_input": user_input,
+            "raw": content if isinstance(content, str) else str(content),
+            "result": result,
+        }
+    )
+    return result
+
+def _llm_use_previous_context(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    if not messages or not user_input:
+        return False
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    last_assistant = _last_assistant_message(messages)
+    system_prompt = (
+        "Decide if the user's message is a direct reply to the assistant's last question "
+        "or a new independent request. Return ONLY JSON: {\"use_previous\": true/false}."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(
+                    content=f"Assistant asked: {last_assistant}\nUser response: {user_input}"
+                ),
+            ]
+        )
+    except Exception as exc:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "llm_use_previous_context_error",
+                "error": str(exc),
+            }
+        )
+        return False
+    content = getattr(response, "content", "")
+    parsed = _parse_json_object(content)
+    result = bool(parsed.get("use_previous")) if isinstance(parsed, dict) else False
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "llm_use_previous_context",
+            "last_assistant": last_assistant,
+            "user_input": user_input,
+            "raw": content if isinstance(content, str) else str(content),
+            "result": result,
+        }
+    )
+    return result
+
+def _llm_is_service_selection(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    services = _services_from_context()
+    if not services or not user_input:
+        return False
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    last_assistant = _last_assistant_message(messages)
+    payload = {
+        "services": services,
+        "assistant_last": last_assistant,
+        "user_input": user_input,
+    }
+    system_prompt = (
+        "Decide if the user is selecting or requesting one of the listed services "
+        "(not asking to list services). Return ONLY JSON: {\"selected\": true/false}."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+    except Exception as exc:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "llm_service_selected_error",
+                "error": str(exc),
+            }
+        )
+        return False
+    content = getattr(response, "content", "")
+    parsed = _parse_json_object(content)
+    result = bool(parsed.get("selected")) if isinstance(parsed, dict) else False
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "llm_service_selected",
+            "user_input": user_input,
+            "raw": content if isinstance(content, str) else str(content),
+            "result": result,
+        }
+    )
+    return result
+
+def _llm_style_specified(user_input: str) -> bool:
+    if not user_input:
+        return False
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    system_prompt = (
+        "Decide if the user explicitly mentions a visual style or aesthetic for an image. "
+        "Return ONLY JSON: {\"style\": true/false}."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_input),
+            ]
+        )
+    except Exception as exc:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "llm_style_specified_error",
+                "error": str(exc),
+            }
+        )
+        return False
+    content = getattr(response, "content", "")
+    parsed = _parse_json_object(content)
+    result = bool(parsed.get("style")) if isinstance(parsed, dict) else False
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "llm_style_specified",
+            "user_input": user_input,
+            "raw": content if isinstance(content, str) else str(content),
+            "result": result,
+        }
+    )
+    return result
+
+def _llm_image_prompt_for_send(messages: list[dict[str, str]] | None, user_input: str) -> str:
+    if not messages:
+        return ""
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    convo: list[str] = []
+    for item in messages[-8:]:
+        role = item.get("role")
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        convo.append(f"{role}: {content}")
+    convo.append(f"user: {user_input}")
+    system_prompt = (
+        "Decide whether the user expects an image to be generated and sent to WhatsApp. "
+        "If yes, return ONLY JSON: {\"generate\": true, \"prompt\": \"...\"} "
+        "with a concise prompt for an image generator, using the conversation context "
+        "and any stated colors/style/branding. If no image is needed, return "
+        "{\"generate\": false, \"prompt\": \"\"}."
+    )
+    response = llm.invoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="\n".join(convo)),
+        ]
+    )
+    parsed = _parse_json_object(getattr(response, "content", ""))
+    if not isinstance(parsed, dict):
+        return ""
+    if not parsed.get("generate"):
+        return ""
+    prompt = str(parsed.get("prompt") or "").strip()
+    return prompt
+
+def _style_prompted(messages: list[dict[str, str]] | None) -> bool:
+    last = _last_assistant_text(messages).lower()
+    if not last:
+        return False
+    tokens = [
+        "style",
+        "visual",
+        "design style",
+        "aesthetic",
+        "look",
+        "نمط",
+        "ستايل",
+        "اسلوب",
+        "أسلوب",
+        "الطابع",
+    ]
+    return any(token in last for token in tokens)
+
+def _looks_like_option_list(text: str) -> bool:
+    if not text:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if re.match(r"(?:-\s*)?(?:option\s*)?\d+\s*[:.)-]\s*", line, flags=re.I):
+            return True
+    return False
+
+def _is_option_selection(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if _selection_index_from_text(cleaned) is not None:
+        return True
+    if re.search(r"\boption\s*\d+", cleaned, flags=re.I):
+        return True
+    llm = _selection_llm()
+    if llm is None:
+        return False
+    system_prompt = (
+        "Decide if the user input is selecting from a list of options. "
+        "Reply ONLY with 'yes' or 'no'."
+    )
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=cleaned),
+            ]
+        )
+    except Exception:
+        return False
+    content = str(getattr(response, "content", "") or "").strip().lower()
+    return "yes" in content
+
+def _selection_implies_images(messages: list[dict[str, str]] | None, user_input: str) -> bool:
+    if not messages or not _is_option_selection(user_input):
+        return False
+    last_assistant = ""
+    for item in reversed(messages):
+        if item.get("role") == "assistant":
+            last_assistant = str(item.get("content") or "")
+            break
+    if not last_assistant:
+        return False
+    if not _looks_like_option_list(last_assistant):
+        return False
+    lowered = last_assistant.lower()
+    return any(term in lowered for term in ("style", "visual", "design"))
+
+
+def _clean_marketing_text(text: str) -> str:
+    if not text:
+        return ""
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    system_prompt = (
+        "Extract the final ready-to-post marketing caption from the assistant response. "
+        "Return ONLY the caption text in the original language. "
+        "Remove meta statements about waiting, sending, or progress."
+    )
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=text)])
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def _is_arabic_text(text: str) -> bool:
+    return bool(re.search(r"[\\u0600-\\u06FF]", text or ""))
+
+
+def _fallback_marketing_text(request_text: str) -> str:
+    request_text = (request_text or "").strip()
+    if _is_arabic_text(request_text):
+        lines = [
+            "عرض حصري لفترة محدودة لإقامتك القادمة.",
+            "استمتع بالرفاهية والخدمة المميزة وذكريات لا تُنسى.",
+            "احجز الآن للاستفادة من العرض.",
+        ]
+    else:
+        lines = [
+            "Limited-time offer for your next hotel stay.",
+            "Enjoy premium comfort, top amenities, and unforgettable memories.",
+            "Book now to secure the offer and plan your perfect getaway.",
+        ]
+    if request_text:
+        lines.append(("تفاصيل: " if _is_arabic_text(request_text) else "Details: ") + request_text)
+    return "\n".join(lines).strip()
+
+
+def _should_generate_images(intent_context: str) -> bool:
+    return _classify_intent(intent_context).get("generate_images", False)
+
+
+def _design_followup_question(intent_context: str, intent: dict[str, Any]) -> str:
+    question = (intent.get("followup_question") or "").strip()
+    if question:
+        return question
+    if _is_arabic_text(intent_context):
+        return "ما نوع التصميم المطلوب؟ وما هي الرسالة الأساسية والنص الذي تريد وضعه؟ هل لديك أسلوب أو ألوان مفضلة؟"
+    return "What type of design do you need, and what main message/text should it include? Any preferred style or colors?"
+
+
+def _brand_choice_question(intent_context: str) -> str:
+    if _is_arabic_text(intent_context):
+        return "هل تريد استخدام شعار وهوية الألوان الموجودة في الملف الشخصي؟"
+    return "Do you want to use the brand logo and identity colors from the profile?"
+
+
+def _build_image_prompt(intent_context: str, intent: dict[str, Any]) -> str:
+    prompt_text = (intent_context or "").strip()
+    # Remove WhatsApp/phone delivery phrasing from image prompts.
+    prompt_text = re.sub(
+        r"(send\\s*(it|this)?\\s*(to)?\\s*(my\\s*)?(phone|number)|"
+        r"ارس\\w*\\s+(التصميم\\s+)?(على|علي)?\\s*رقمي|"
+        r"ابعت\\w*\\s+(التصميم\\s+)?(على|علي)?\\s*رقمي)",
+        "",
+        prompt_text,
+        flags=re.IGNORECASE,
+    ).strip()
+    if prompt_text:
+        prompt_text += "\n"
+    if intent.get("use_brand_logo") is False or intent.get("use_brand_colors") is False:
+        prompt_text += "Do not use brand logo or brand colors. Without logo or branding.\n"
+    prompt_text += "Do not include women or female people."
+    return prompt_text.strip()
+
+
+def _has_brand_profile() -> bool:
+    profile = _brand_profile()
+    if not isinstance(profile, dict):
+        return False
+    has_logo = bool(_normalize_url(profile.get("logo_url") or ""))
+    colors = profile.get("colors") or []
+    has_colors = isinstance(colors, list) and any(str(color).strip() for color in colors)
+    return has_logo or has_colors
+
+
+def _design_wait_message(intent_context: str) -> str:
+    if _is_arabic_text(intent_context):
+        return "جارٍ توليد التصميم الآن. يرجى الانتظار."
+    return "Generating the design now. Please wait."
+
+
+def _is_yes_no_response(text: str) -> bool:
+    cleaned = (text or "").strip().lower()
+    return cleaned in {"yes", "no", "y", "n", "نعم", "لا", "اي", "أيوه", "ايوه"}
+
+
+def _apply_brand_choice(intent: dict[str, Any], response_text: str) -> None:
+    if not _is_yes_no_response(response_text):
+        return
+    normalized = (response_text or "").strip().lower()
+    if normalized in {"no", "n", "لا"}:
+        intent["use_brand_logo"] = False
+        intent["use_brand_colors"] = False
+    else:
+        intent["use_brand_logo"] = True
+        intent["use_brand_colors"] = True
+    intent["needs_brand_choice"] = False
+
+
+def _last_assistant_message(messages: list[dict[str, str]] | None) -> str:
+    if not messages:
+        return ""
+    for item in reversed(messages):
+        if item.get("role") == "assistant":
+            return str(item.get("content") or "")
+    return ""
+
+
+def _apply_brand_profile_to_prompt(prompt: str) -> str:
+    profile = _brand_profile()
+    if not isinstance(profile, dict):
+        return prompt
+    if _should_skip_branding(prompt):
+        return prompt
+    brand_logo = _normalize_url(profile.get("logo_url") or "")
+    brand_colors = profile.get("colors") if isinstance(profile, dict) else []
+    additions: list[str] = []
+    lowered = (prompt or "").lower()
+    if brand_logo and "logo" not in lowered and brand_logo not in prompt:
+        additions.append(f"Brand logo URL: {brand_logo}. Use this logo clearly and keep it intact.")
+    if isinstance(brand_colors, list):
+        color_list = ", ".join([str(color) for color in brand_colors if str(color).strip()])
+        if color_list and "brand colors" not in lowered:
+            additions.append(f"Brand colors: {color_list}.")
+    if not additions:
+        return prompt
+    return (prompt.strip() + "\n" + "\n".join(additions)).strip()
+
+
+def _image_generate(prompt: str, count: int = 1, image_url: str | None = None) -> str:
+    ids = _integration_ids()
+    if not _has_balance():
+        return "Insufficient balance. Please recharge."
+    if "nano-banan-pro" in ids:
+        enhanced_prompt = _apply_brand_profile_to_prompt(prompt)
+        return nano_banan_image_generate.invoke({"prompt": enhanced_prompt, "count": count})
+    if "gemini-image" in ids:
+        payload: dict[str, Any] = {"prompt": prompt, "count": count}
+        if image_url:
+            payload["image_url"] = image_url
+        return gemini_image_generate.invoke(payload)
+    return "No image generation integration is configured."
+
+
+def _append_generated_image(output: str, prompt: str, intent_context: str) -> str:
+    urls = _extract_image_urls(output)
+    if urls:
+        return output
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "gemini_generate_start",
+            "prompt": prompt,
+        }
+    )
+    generated = _image_generate(prompt, 1)
+    urls = _extract_image_urls(generated)
+    if not urls:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "gemini_generate_empty",
+                "response": str(generated)[:4000],
+            }
+        )
+        return output
+    _write_action_log(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event": "gemini_generate_success",
+            "image_url": urls[0],
+        }
+    )
+    wait_msg = _design_wait_message(intent_context)
+    prefix = output.strip()
+    if wait_msg and wait_msg.lower() not in prefix.lower():
+        prefix = f"{prefix}\n{wait_msg}".strip() if prefix else wait_msg
+    success = "Image created successfully."
+    if _is_arabic_text(intent_context):
+        success = "تم إنشاء الصورة بنجاح."
+    return f"{prefix}\n{urls[0]}\n{success}".strip()
+
+
+def _intent_context(user_input: str, messages: list[dict[str, str]] | None = None) -> str:
+    if user_input:
+        cleaned = user_input.strip()
+        if not messages:
+            return cleaned
+        if not _design_enabled():
+            return cleaned
+        last_assistant = _last_assistant_message(messages).lower()
+        asked_design = any(
+            token in last_assistant
+            for token in (
+                "نوع التصميم",
+                "design",
+                "logo",
+                "colors",
+                "الشعار",
+                "الألوان",
+                "هوية",
+                "brand",
+            )
+        )
+        if asked_design:
+            for item in reversed(messages):
+                if item.get("role") == "user":
+                    previous = (item.get("content") or "").strip()
+                    if previous and previous != cleaned:
+                        return (
+                            f"{previous}\n"
+                            f"Assistant asked: {_last_assistant_message(messages)}\n"
+                            f"User response: {cleaned}"
+                        )
+        if _llm_is_service_selection(messages, cleaned):
+            return cleaned
+        short_reply = len(cleaned.split()) <= 3
+        yes_no = cleaned.lower() in {"yes", "no", "y", "n", "نعم", "لا", "اي", "أيوه", "ايوه"}
+        if short_reply or yes_no:
+            if not _llm_use_previous_context(messages, cleaned):
+                return cleaned
+            for item in reversed(messages):
+                if item.get("role") == "user":
+                    previous = (item.get("content") or "").strip()
+                    if previous and previous != cleaned:
+                        return (
+                            f"{previous}\n"
+                            f"Assistant asked: {_last_assistant_message(messages)}\n"
+                            f"User response: {cleaned}"
+                        )
+        return cleaned
+    if messages:
+        for item in reversed(messages):
+            if item.get("role") == "user":
+                content = (item.get("content") or "").strip()
+                if content:
+                    return content
+    return ""
+
+
+def _generate_text_only(messages: list[Any]) -> str:
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    system_prompt = (
+        "You are a hotel marketing copywriter. Write a ready-to-post social media caption "
+        "in 2-4 short sentences. Include a clear call to action (e.g., 'Book now'). "
+        "Match the user's language (Arabic stays Arabic). "
+        "Do not mention sending, WhatsApp, or waiting. "
+        "Do not include planning or meta language (e.g., 'the content will focus', "
+        "'this post', or 'I will'). Do not include URLs."
+    )
+    response = llm.invoke([SystemMessage(content=system_prompt)] + messages)
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def _send_images_async(prompt: str, urls: list[str], intent: dict[str, Any] | None = None) -> None:
+    def worker() -> None:
+        try:
+            resolved = list(urls)
+            attempts = 0
+            prompt_text = _build_image_prompt(prompt, intent or _classify_intent(prompt))
+            _write_action_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "event": "whatsapp_image_generate_start",
+                    "prompt": prompt_text,
+                }
+            )
+            while len(resolved) < 1 and attempts < 3:
+                generated = _image_generate(prompt_text, 1)
+                resolved.extend(_extract_image_urls(generated))
+                resolved = list(dict.fromkeys(resolved))
+                attempts += 1
+            for idx, url in enumerate(resolved[:1], start=1):
+                whatsapp_send_file.invoke({"url": url, "filename": f"image-{idx}.png"})
+                _write_action_log(
+                    {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "event": "whatsapp_image_sent",
+                        "image_url": url,
+                    }
+                )
+        except Exception as exc:
+            _write_action_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "event": "whatsapp_image_error",
+                    "error": str(exc),
+                }
+            )
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _dispatch_whatsapp_delivery_async(messages: list[Any], intent_context: str) -> None:
+    def worker() -> None:
+        try:
+            intent = _classify_intent(intent_context)
+            if intent.get("wants_marketing"):
+                output = _generate_text_only(messages)
+            else:
+                output = _generate_whatsapp_response(messages)
+            _send_marketing_to_owner(output, intent_context, intent)
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _generate_whatsapp_response(messages: list[Any]) -> str:
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
+    system_prompt = (
+        "Write a short response for WhatsApp in the user's language. "
+        "Be concise, helpful, and avoid meta statements about sending or waiting. "
+        "If the user asked for a design/image, acknowledge briefly without asking many questions."
+    )
+    response = llm.invoke([SystemMessage(content=system_prompt)] + messages)
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def _send_marketing_to_owner(
+    output: str,
+    intent_context: str,
+    intent: dict[str, Any] | None = None,
+) -> bool:
+    if not _whatsapp_owner_phone():
+        return False
+    intent = intent or _classify_intent(intent_context)
+    urls = _extract_image_urls(output)
+    text_body = _strip_image_lines(output, urls)
+    if intent.get("wants_marketing"):
+        text_body = _clean_marketing_text(text_body)
+        if _is_arabic_text(intent_context) and not _is_arabic_text(text_body):
+            text_body = ""
+        if not text_body:
+            text_body = _fallback_marketing_text(intent_context)
+    else:
+        if _is_arabic_text(intent_context) and not _is_arabic_text(text_body):
+            text_body = ""
+        if not text_body:
+            text_body = "تم استلام طلبك وسأجهز التصميم الآن." if _is_arabic_text(intent_context) else "Got it. Preparing the design now."
+    if text_body:
+        whatsapp_send_message.invoke({"text": text_body})
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "whatsapp_text_sent",
+                "text": text_body[:4000],
+            }
+        )
+    if urls or intent.get("generate_images"):
+        notice = "Images are generating now. Please wait."
+        if _is_arabic_text(intent_context):
+            notice = "جارٍ توليد الصور الآن. يرجى الانتظار."
+        whatsapp_send_message.invoke({"text": notice})
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "whatsapp_notice_sent",
+                "text": notice,
+            }
+        )
+        _send_images_async(intent_context, urls, intent)
+    return True
+
+def _ensure_gemini_image_connected() -> None:
+    creds = _integration_credentials("gemini-image")
+    if not creds:
+        return
+    device_id = _get_device_id()
+    api_key = None
+    if isinstance(creds, dict):
+        api_key = creds.get("api_key") or creds.get("api_token") or creds.get("token")
+    if not device_id or not api_key:
+        return
+    cache_key = f"{device_id}:gemini-image"
+    if cache_key in CONNECTED_INTEGRATIONS:
+        return
+    payload: dict[str, Any] = {"device_id": device_id, "api_key": api_key}
+    if creds.get("model"):
+        payload["model"] = creds.get("model")
+    _integration_request("POST", "/integrations/gemini-image/connect", json_body=payload)
+    CONNECTED_INTEGRATIONS.add(cache_key)
+
+
+def _normalize_time(value: str) -> str:
+    value = value.strip()
+    if re.match(r"^\\d{2}:\\d{2}$", value):
+        return f"{value}:00"
+    return value
+
+
+@tool("rag_search")
+def rag_search(query: str) -> str:
+    """Search across uploaded files and Postman context."""
+    store = load_vectorstore("{{ agent_name }}", "{{ device_id }}")
+    docs = store.similarity_search(query, k=4)
+    return "\n\n".join([doc.page_content for doc in docs])
+
+
+@tool("match_option")
+def match_option(options: list[str], query: str) -> str:
+    """Return the closest matching option from a list."""
+    if not options or not query:
+        return ""
+    query_lower = query.strip().lower()
+    best = ""
+    best_score = 0.0
+    for opt in options:
+        score = 0.0
+        opt_lower = opt.lower()
+        if query_lower == opt_lower:
+            return opt
+        if query_lower in opt_lower:
+            score = 0.8
+        else:
+            # lightweight similarity
+            overlap = len(set(query_lower.split()) & set(opt_lower.split()))
+            score = overlap / max(len(set(opt_lower.split())), 1)
+        if score > best_score:
+            best_score = score
+            best = opt
+    return best if best_score >= 0.5 else ""
+
+def _resolve_variables(raw: str) -> str:
+    if not raw:
+        return raw
+    for key, value in POSTMAN_VARIABLES.items():
+        raw = raw.replace("{" + "{" + key + "}" + "}", value)
+    base_url = os.getenv("POSTMAN_BASE_URL")
+    if base_url:
+        raw = raw.replace("{" + "{baseUrl}" + "}", base_url)
+    db_value = os.getenv("POSTMAN_DB")
+    if db_value:
+        raw = raw.replace("{" + "{db}" + "}", db_value)
+    return raw
+
+
+def _lookup_request(endpoint_name: str) -> dict[str, Any] | None:
+    for req in POSTMAN_REQUESTS:
+        if req.get("name") == endpoint_name:
+            return req
+    return None
+
+
+def _apply_path_replacements(url: str, path_replacements: dict | None) -> str:
+    if not path_replacements:
+        return url
+    booking_number = path_replacements.get("booking_number") or path_replacements.get("booking_id")
+    if booking_number:
+        updated = re.sub(r"/booking/[^/]+/update", f"/booking/{booking_number}/update", url)
+        if updated != url:
+            return updated
+        return re.sub(r"BK\\d+", str(booking_number), url)
+    for key, value in path_replacements.items():
+        url = url.replace(str(key), str(value))
+    return url
+
+
+def _login_if_needed() -> None:
+    if SESSION_HEADERS.get("Authorization") or not POSTMAN_LOGIN:
+        return
+    login_url = _resolve_variables(POSTMAN_LOGIN.get("url", ""))
+    split = urlsplit(login_url)
+    base_url = urlunsplit((split.scheme, split.netloc, split.path, "", split.fragment))
+    query_from_url = {k: v[0] for k, v in parse_qs(split.query).items()}
+    login_headers = POSTMAN_LOGIN.get("headers", {})
+    body_raw = _resolve_variables(POSTMAN_LOGIN.get("body") or "")
+    json_body = None
+    if body_raw:
+        try:
+            json_body = json.loads(body_raw)
+        except json.JSONDecodeError:
+            json_body = None
+    log_entry = {
+        "name": POSTMAN_LOGIN.get("name", "Login"),
+        "method": POSTMAN_LOGIN.get("method", "POST"),
+        "url": login_url,
+        "headers": login_headers,
+        "json_body": json_body,
+        "data": body_raw if json_body is None else None,
+    }
+    try:
+        response = SESSION.request(
+            method=POSTMAN_LOGIN.get("method", "POST"),
+            url=base_url,
+            headers=login_headers,
+            params=query_from_url or None,
+            json=json_body,
+            data=body_raw if json_body is None else None,
+            timeout=POSTMAN_TIMEOUT,
+        )
+        log_entry["status"] = response.status_code
+        log_entry["response"] = response.text
+        LOGS.append(log_entry)
+        _write_log(log_entry)
+    except Exception as exc:
+        log_entry["status"] = "error"
+        log_entry["error"] = str(exc)
+        LOGS.append(log_entry)
+        _write_log(log_entry)
+        raise
+    token = None
+    header_auth = response.headers.get("Authorization") or response.headers.get("authorization")
+    if header_auth and isinstance(header_auth, str) and header_auth.strip():
+        token = header_auth.strip()
+        if not token.lower().startswith("bearer "):
+            token = f"Bearer {token}"
+    if token is None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        token = _extract_bearer_token(payload)
+    if token:
+        SESSION_HEADERS["Authorization"] = token
+
+
+@tool("postman_call")
+def postman_call(
+    endpoint_name: str,
+    json_body: dict | None = None,
+    query: dict | None = None,
+    path_replacements: dict | None = None,
+) -> str:
+    """Call a Postman endpoint by name. Auto-login before non-login calls."""
+    if not POSTMAN_REQUESTS:
+        return "No Postman endpoints configured."
+    request_info = _lookup_request(endpoint_name)
+    if not request_info:
+        return f"Endpoint '{endpoint_name}' not found."
+    url_hint = request_info.get("url", "")
+    if endpoint_name.lower() == "update booking" or "/booking/" in url_hint and "/update" in url_hint:
+        booking_number = None
+        if path_replacements:
+            booking_number = path_replacements.get("booking_number") or path_replacements.get("booking_id")
+        if not booking_number:
+            return "Update Booking requires booking_number in path_replacements."
+    if endpoint_name.lower() == "get reservation":
+        if not query or not query.get("search"):
+            return "Get Reservation requires query.search (booking number)."
+    if POSTMAN_LOGIN and request_info.get("name") != POSTMAN_LOGIN.get("name"):
+        _login_if_needed()
+    url = _resolve_variables(request_info.get("url", ""))
+    url = _apply_path_replacements(url, path_replacements)
+    split = urlsplit(url)
+    base_url = urlunsplit((split.scheme, split.netloc, split.path, "", split.fragment))
+    query_from_url = {k: v[0] for k, v in parse_qs(split.query).items()}
+    merged_query = {**query_from_url, **(query or {})}
+    url = base_url
+    headers = dict(request_info.get("headers", {}))
+    headers.update(SESSION_HEADERS)
+    body_raw = request_info.get("body")
+    if json_body is None and body_raw:
+        try:
+            json_body = json.loads(_resolve_variables(body_raw))
+        except json.JSONDecodeError:
+            json_body = None
+            body_raw = _resolve_variables(body_raw)
+    log_entry = {
+        "name": request_info.get("name"),
+        "method": request_info.get("method", "GET"),
+        "url": url,
+        "headers": headers,
+        "query": query,
+        "json_body": json_body,
+        "data": None if json_body is not None else body_raw,
+    }
+    try:
+        response = SESSION.request(
+            method=request_info.get("method", "GET"),
+            url=url,
+            headers=headers,
+            params=merged_query or None,
+            json=json_body,
+            data=None if json_body is not None else body_raw,
+            timeout=POSTMAN_TIMEOUT,
+        )
+        log_entry["status"] = response.status_code
+        log_entry["response"] = response.text
+        LOGS.append(log_entry)
+        _write_log(log_entry)
+        _write_integration_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "type": "postman_call",
+                "name": request_info.get("name"),
+                "method": request_info.get("method", "GET"),
+                "url": url,
+                "status": response.status_code,
+                "response": response.text[:4000],
+            }
+        )
+        return f"Status: {response.status_code}\n{response.text}"
+    except Exception as exc:
+        log_entry["status"] = "error"
+        log_entry["error"] = str(exc)
+        LOGS.append(log_entry)
+        _write_log(log_entry)
+        _write_integration_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "type": "postman_call",
+                "name": request_info.get("name"),
+                "method": request_info.get("method", "GET"),
+                "url": url,
+                "status": "error",
+                "error": str(exc),
+            }
+        )
+        return f"Status: error\n{exc}"
+
+
+@tool("get_request_logs")
+def get_request_logs() -> str:
+    """Get recent HTTP call logs."""
+    return json.dumps(LOGS[-10:], indent=2)
+
+
+@tool("http_request")
+def http_request(
+    method: str,
+    url: str,
+    headers: dict | None = None,
+    params: dict | None = None,
+    json_body: dict | None = None,
+    data: str | None = None,
+    timeout: int = 30,
+) -> str:
+    """Call an HTTP endpoint described in the Postman collection."""
+    response = requests.request(
+        method=method,
+        url=url,
+        headers=headers,
+        params=params,
+        json=json_body,
+        data=data,
+        timeout=timeout,
+    )
+    return f"Status: {response.status_code}\n{response.text}"
+
+
+@tool("google_calendar_list_calendars")
+def google_calendar_list_calendars() -> str:
+    """List calendars for the connected Google Calendar integration."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for calendar request."
+    _ensure_google_connected("calendar", "google-calendar")
+    return _integration_request(
+        "GET",
+        "/integrations/google/calendar",
+        params={"device_id": device_id},
+    )
+
+
+@tool("google_calendar_list_events")
+def google_calendar_list_events(
+    calendar_id: str | None = None,
+    time_min: str | None = None,
+    time_max: str | None = None,
+    max_results: int | None = None,
+) -> str:
+    """List Google Calendar events."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for calendar request."
+    _ensure_google_connected("calendar", "google-calendar")
+    calendar_id = calendar_id or _google_calendar_default_id()
+    params: dict[str, Any] = {"device_id": device_id, "calendar_id": calendar_id}
+    if time_min:
+        params["time_min"] = time_min
+    if time_max:
+        params["time_max"] = time_max
+    if max_results:
+        params["max_results"] = max_results
+    return _integration_request(
+        "GET",
+        "/integrations/google/calendar/events",
+        params=params,
+    )
+
+
+@tool("google_calendar_create_event")
+def google_calendar_create_event(
+    summary: str,
+    date: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    timezone: str | None = None,
+    description: str | None = None,
+    calendar_id: str | None = None,
+) -> str:
+    """Create a Google Calendar event. If no time is provided, an all-day event is created."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for calendar request."
+    _ensure_google_connected("calendar", "google-calendar")
+    calendar_id = calendar_id or _google_calendar_default_id()
+    event: dict[str, Any] = {"summary": summary}
+    if description:
+        event["description"] = description
+    if start_time:
+        start_value = _normalize_time(start_time)
+        tz = timezone or "UTC"
+        start_dt = datetime.fromisoformat(f"{date}T{start_value}")
+        if end_time:
+            end_value = _normalize_time(end_time)
+            end_dt = datetime.fromisoformat(f"{date}T{end_value}")
+        else:
+            end_dt = start_dt + timedelta(hours=1)
+        event["start"] = {"dateTime": start_dt.isoformat(), "timeZone": tz}
+        event["end"] = {"dateTime": end_dt.isoformat(), "timeZone": tz}
+    else:
+        start_date = datetime.fromisoformat(date).date()
+        end_date = start_date + timedelta(days=1)
+        event["start"] = {"date": start_date.isoformat()}
+        event["end"] = {"date": end_date.isoformat()}
+    raw = _integration_request(
+        "POST",
+        "/integrations/google/calendar/events",
+        json_body={"device_id": device_id, "calendar_id": calendar_id, "event": event},
+    )
+    parsed = _parse_json_response(raw)
+    if parsed:
+        error = parsed.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or "Calendar API returned an error."
+            return f"Calendar error: {message}"
+        if parsed.get("status") == "confirmed" or parsed.get("id"):
+            lines = [
+                "Event created successfully.",
+                f"Summary: {summary}",
+                f"Date: {date}",
+            ]
+            link = parsed.get("htmlLink")
+            if link:
+                lines.append(f"Link: {link}")
+            return "\n".join(lines)
+    return raw
+
+
+@tool("google_sheets_get_values")
+def google_sheets_get_values(spreadsheet_id: str, sheet_range: str) -> str:
+    """Read values from Google Sheets."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for sheets request."
+    _ensure_google_connected("sheets", "google-sheets")
+    return _integration_request(
+        "GET",
+        "/integrations/google/sheets/values",
+        params={"device_id": device_id, "spreadsheet_id": spreadsheet_id, "range": sheet_range},
+    )
+
+
+@tool("google_sheets_append_values")
+def google_sheets_append_values(
+    spreadsheet_id: str,
+    sheet_range: str,
+    values: list[list[Any]],
+    value_input_option: str | None = None,
+    insert_data_option: str | None = None,
+) -> str:
+    """Append values to Google Sheets."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for sheets request."
+    _ensure_google_connected("sheets", "google-sheets")
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "spreadsheet_id": spreadsheet_id,
+        "range": sheet_range,
+        "values": values,
+    }
+    if value_input_option:
+        payload["value_input_option"] = value_input_option
+    if insert_data_option:
+        payload["insert_data_option"] = insert_data_option
+    return _integration_request(
+        "POST",
+        "/integrations/google/sheets/append",
+        json_body=payload,
+    )
+
+
+@tool("google_drive_list_files")
+def google_drive_list_files(query: str | None = None, page_size: int | None = None) -> str:
+    """Search Google Drive files."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for drive request."
+    _ensure_google_connected("drive", "google-drive")
+    params: dict[str, Any] = {"device_id": device_id}
+    if query:
+        params["q"] = query
+    if page_size:
+        params["page_size"] = page_size
+    return _integration_request(
+        "GET",
+        "/integrations/google/drive/files",
+        params=params,
+    )
+
+
+@tool("google_gmail_send")
+def google_gmail_send(
+    to: str,
+    subject: str,
+    body: str,
+    from_email: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+) -> str:
+    """Send an email via Gmail."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for Gmail request."
+    _ensure_google_connected("gmail", "google-gmail")
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "to": to,
+        "subject": subject,
+        "body": body,
+    }
+    if from_email:
+        payload["from"] = from_email
+    if cc:
+        payload["cc"] = cc
+    if bcc:
+        payload["bcc"] = bcc
+    return _integration_request(
+        "POST",
+        "/integrations/google/gmail/send",
+        json_body=payload,
+    )
+
+
+@tool("gemini_image_generate")
+def gemini_image_generate(
+    prompt: str,
+    model: str | None = None,
+    count: int | None = 1,
+    image_url: str | None = None,
+) -> str:
+    """Generate an image with Google AI Studio."""
+    if not _has_balance():
+        return "Insufficient balance. Please recharge."
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for image generation request."
+    _ensure_gemini_image_connected()
+    gemini_creds = _integration_credentials("gemini-image")
+    style_template = str(gemini_creds.get("style_template") or "").strip()
+    style_custom = str(gemini_creds.get("style_custom") or "").strip()
+    style_text = style_custom or style_template
+    if style_text and style_text.lower() not in prompt.lower():
+        prompt = f"{prompt}\\nDesign style: {style_text}."
+    brand_profile = _brand_profile()
+    skip_branding = _should_skip_branding(prompt)
+    brand_logo = _normalize_url(brand_profile.get("logo_url")) if isinstance(brand_profile, dict) else None
+    brand_colors = brand_profile.get("colors") if isinstance(brand_profile, dict) else []
+    image_url = _normalize_url(image_url)
+    if not skip_branding:
+        if not image_url and brand_logo:
+            image_url = brand_logo
+        if brand_colors and isinstance(brand_colors, list):
+            color_list = ", ".join([str(color) for color in brand_colors if str(color).strip()])
+            if color_list:
+                prompt = f"{prompt}\\nUse brand colors: {color_list}."
+        if brand_logo and "logo" not in prompt.lower():
+            prompt = f"{prompt}\\nPlace the provided brand logo clearly on the design and keep it intact."
+        if brand_logo:
+            prompt = f"{prompt}\\nEnsure the logo is visible and consistent with the brand identity."
+    if image_url and "logo" not in prompt.lower() and not skip_branding:
+        prompt = f"{prompt}\\nUse the attached image as the logo."
+    payload: dict[str, Any] = {"device_id": device_id, "prompt": prompt}
+    if model:
+        payload["model"] = model
+    if count is not None:
+        payload["count"] = count
+    if image_url:
+        payload["image_url"] = image_url
+    raw = _integration_request(
+        "POST",
+        "/integrations/gemini-image/generate",
+        json_body=payload,
+    )
+    def _estimate_gemini_image_cost(
+        model_name: str | None,
+        image_count: int,
+        has_image_input: bool,
+    ) -> tuple[float | None, dict[str, float], list[str]]:
+        assumptions: list[str] = []
+        breakdown: dict[str, float] = {}
+        if not model_name or image_count <= 0:
+            return None, breakdown, assumptions
+        model_key = model_name.strip().lower()
+        total = 0.0
+        if "gemini-2.5-flash-image" in model_key:
+            per_image = 0.039
+            breakdown["output_images_usd"] = per_image * image_count
+            total += breakdown["output_images_usd"]
+            assumptions.append("Gemini 2.5 Flash Image output priced at $0.039 per image (1K tokens).")
+        elif "gemini-3-pro-image-preview" in model_key:
+            per_image = 0.134
+            breakdown["output_images_usd"] = per_image * image_count
+            total += breakdown["output_images_usd"]
+            assumptions.append("Gemini 3 Pro Image output assumed 1K/2K size at $0.134 per image.")
+            if has_image_input:
+                input_per_image = 0.0011
+                breakdown["input_images_usd"] = input_per_image
+                total += breakdown["input_images_usd"]
+                assumptions.append("Gemini 3 Pro image input assumed $0.0011 per image.")
+        else:
+            return None, breakdown, assumptions
+        return total, breakdown, assumptions
+
+    estimated_cost, cost_breakdown, cost_assumptions = _estimate_gemini_image_cost(
+        model or str(gemini_creds.get("model") or ""),
+        max(int(count or 1), 1),
+        bool(image_url),
+    )
+    if estimated_cost is not None:
+        _write_integration_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "type": "gemini_image_generate_cost",
+                "model": model or gemini_creds.get("model"),
+                "image_count": max(int(count or 1), 1),
+                "estimated_cost_usd": round(estimated_cost, 6),
+                "cost_breakdown": cost_breakdown,
+                "cost_assumptions": cost_assumptions,
+            }
+        )
+    parsed = _parse_json_response(raw)
+    if parsed:
+        urls = parsed.get("image_urls")
+        if isinstance(urls, list) and urls:
+            unique_urls: list[str] = []
+            seen_urls: set[str] = set()
+            for url in urls:
+                if not isinstance(url, str):
+                    continue
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                unique_urls.append(url)
+            if unique_urls:
+                if max(int(count or 1), 1) == 1:
+                    return f"Image generated: {unique_urls[0]}"
+                return "Images generated:\n" + "\n".join([f"- {url}" for url in unique_urls])
+        if parsed.get("image_url"):
+            return f"Image generated: {parsed.get('image_url')}"
+        if parsed.get("detail"):
+            return str(parsed.get("detail"))
+    return raw
+
+
+@tool("nano_banan_image_generate")
+def nano_banan_image_generate(
+    prompt: str,
+    model: str | None = None,
+    count: int | None = 1,
+) -> str:
+    """Generate an image via OpenRouter."""
+    if not _has_balance():
+        return "Insufficient balance. Please recharge."
+    creds = _integration_credentials("nano-banan-pro")
+    api_key = str(
+        creds.get("api_key")
+        or creds.get("openrouter_api_key")
+        or os.getenv("OPENROUTER_API_KEY", "")
+        or ""
+    ).strip()
+    if not api_key:
+        return "Missing OpenRouter API key for nano-banan-pro integration."
+    base_url = str(creds.get("base_url") or "https://openrouter.ai/api/v1").strip()
+    if not base_url:
+        base_url = "https://openrouter.ai/api/v1"
+    model_name = model or str(creds.get("model") or "google/gemini-3-pro-image-preview").strip()
+    if not model_name:
+        model_name = "google/gemini-3-pro-image-preview"
+    # Normalize localized or shorthand Gemini model names.
+    normalized = model_name.strip()
+    normalized = normalized.replace("جوجل/", "google/").replace("الجوزاء", "gemini")
+    if "/" not in normalized and normalized.startswith("gemini-"):
+        normalized = f"google/{normalized}"
+    if normalized:
+        model_name = normalized
+    images: list[str] = []
+    requested = max(int(count or 1), 1)
+    for _ in range(requested):
+        try:
+            client = OpenAI(base_url=base_url, api_key=api_key)
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                extra_body={"modalities": ["image", "text"]},
+            )
+        except Exception as exc:
+            return f"OpenRouter image request failed: {exc}"
+        message = response.choices[0].message if response and response.choices else None
+        imgs: list[Any] = []
+        if message is None:
+            continue
+        if hasattr(message, "images"):
+            imgs = getattr(message, "images") or []
+        elif isinstance(message, dict):
+            imgs = message.get("images") or []
+        if isinstance(imgs, list):
+            for img in imgs:
+                if isinstance(img, dict):
+                    image_url = None
+                    image_url_obj = img.get("image_url")
+                    if isinstance(image_url_obj, dict):
+                        image_url = image_url_obj.get("url")
+                    if not image_url:
+                        image_url = img.get("url")
+                    if image_url:
+                        if image_url.startswith("data:image/"):
+                            uploaded = _upload_generated_image(image_url)
+                            if uploaded:
+                                images.append(uploaded)
+                        else:
+                            images.append(image_url)
+    if images:
+        unique_images: list[str] = []
+        seen_images: set[str] = set()
+        for url in images:
+            if url in seen_images:
+                continue
+            seen_images.add(url)
+            unique_images.append(url)
+        if unique_images:
+            if max(int(count or 1), 1) == 1:
+                return f"Image generated: {unique_images[0]}"
+            if len(unique_images) == 1:
+                return f"Image generated: {unique_images[0]}"
+            return "Images generated:\n" + "\n".join([f"- {url}" for url in unique_images])
+    return "No image was returned from OpenRouter."
+
+
+@tool("telegram_send_message")
+def telegram_send_message(chat_id: str, text: str) -> str:
+    """Send a Telegram message."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for Telegram request."
+    _ensure_telegram_connected()
+    payload = {"device_id": device_id, "chat_id": chat_id, "text": text}
+    return _integration_request(
+        "POST",
+        "/integrations/telegram/send",
+        json_body=payload,
+    )
+
+
+@tool("whatsapp_send_message")
+def whatsapp_send_message(to: str | None = None, text: str = "", chat_type: str | None = None) -> str:
+    """Send a WhatsApp message. If "to" is omitted, uses the WhatsApp owner phone."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for WhatsApp request."
+    _ensure_whatsapp_connected()
+    if not text:
+        return "Message text is required."
+    cleaned = _clean_marketing_text(text)
+    if cleaned:
+        text = cleaned
+    resolved_to = to
+    if isinstance(resolved_to, str):
+        resolved_to = resolved_to.strip()
+        if resolved_to.lower() in {"me", "my", "myself", "owner"}:
+            resolved_to = ""
+    if not resolved_to:
+        resolved_to = _whatsapp_owner_phone()
+    if not resolved_to:
+        return "Recipient number is required (or configure the WhatsApp owner phone)."
+    payload: dict[str, Any] = {"device_id": device_id, "to": resolved_to, "text": text}
+    if chat_type is not None:
+        payload["chat_type"] = chat_type
+    return _integration_request(
+        "POST",
+        "/integrations/whatsapp/send",
+        json_body=payload,
+    )
+
+
+@tool("whatsapp_send_file")
+def whatsapp_send_file(url: str, filename: str | None = None, caption: str | None = None, to: str | None = None, chat_type: str | None = None) -> str:
+    """Send a WhatsApp image/file by URL. If "to" is omitted, uses the WhatsApp owner phone."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for WhatsApp request."
+    _ensure_whatsapp_connected()
+    if not url:
+        return "Media URL is required."
+    resolved_to = to
+    if isinstance(resolved_to, str):
+        resolved_to = resolved_to.strip()
+        if resolved_to.lower() in {"me", "my", "myself", "owner"}:
+            resolved_to = ""
+    if not resolved_to:
+        resolved_to = _whatsapp_owner_phone()
+    if not resolved_to:
+        return "Recipient number is required (or configure the WhatsApp owner phone)."
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "to": resolved_to,
+        "media_url": url,
+    }
+    if filename:
+        payload["filename"] = filename
+    if caption:
+        payload["caption"] = caption
+    if chat_type is not None:
+        payload["chat_type"] = chat_type
+    return _integration_request(
+        "POST",
+        "/integrations/whatsapp/send",
+        json_body=payload,
+    )
+
+
+@tool("messenger_send_message")
+def messenger_send_message(recipient_id: str, message: str) -> str:
+    """Send a Messenger message."""
+    device_id = _get_device_id()
+    if not device_id:
+        return "Missing device id for Messenger request."
+    payload = {"device_id": device_id, "recipient_id": recipient_id, "message": message}
+    return _integration_request(
+        "POST",
+        "/integrations/meta/messenger/send",
+        json_body=payload,
+    )
+
+
+def _build_graph(
+    system_prompt_override: str | None = None,
+    callbacks: list[Any] | None = None,
+    streaming: bool = False,
+) -> Any:
+    api_key = get_openai_api_key()
+    model = get_openai_model()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        temperature=0,
+        timeout=LLM_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+        streaming=streaming,
+        callbacks=callbacks,
+    )
+
+    base_tools = [
+        rag_search,
+        http_request,
+        postman_call,
+        match_option,
+        get_request_logs,
+    ]
+    tools = base_tools + _integration_tools()
+    if system_prompt_override and "NO_WHATSAPP_TOOLS" in system_prompt_override:
+        tools = [
+            tool
+            for tool in tools
+            if _tool_name(tool) not in {"whatsapp_send_message", "whatsapp_send_file"}
+        ]
+    llm = llm.bind_tools(tools)
+
+    system_prompt = system_prompt_override or _format_context()
+
+    def agent_node(state: MessagesState) -> dict[str, Any]:
+        messages = state["messages"]
+        invoke_config = {"callbacks": callbacks} if callbacks else None
+        response = llm.invoke([SystemMessage(content=system_prompt)] + messages, config=invoke_config)
+        return {"messages": messages + [response]}
+
+    tool_node = ToolNode(tools)
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", tool_node)
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges("agent", tools_condition)
+    def route_tool_responses(state: MessagesState) -> str:
+        for message in reversed(state["messages"]):
+            if not isinstance(message, ToolMessage):
+                break
+            if message.name in RETURN_DIRECT_TOOLS:
+                return END
+        return "agent"
+
+    if RETURN_DIRECT_TOOLS:
+        graph.add_conditional_edges("tools", route_tool_responses)
+    else:
+        graph.add_edge("tools", "agent")
+    graph.add_edge("agent", END)
+    return graph.compile()
+
+def _extract_response(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _parse_services_text(text: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[;,\n]+", text or "") if item.strip()]
+
+
+def _services_from_context() -> list[str]:
+    services = AGENT_CONTEXT.get("services", "") or ""
+    service_list = _parse_services_text(str(services))
+    if service_list:
+        return service_list
+    flow = AGENT_CONTEXT.get("flow", "") or ""
+    flow_lines = [line.strip() for line in str(flow).splitlines() if line.strip()]
+    for line in flow_lines:
+        if ":" in line:
+            name = line.split(":", 1)[0].strip()
+            if name:
+                service_list.append(name)
+        else:
+            service_list.extend(_parse_services_text(line))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in service_list:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _is_services_request(text: str) -> bool:
+    value = (text or "").lower()
+    keywords = [
+        "services",
+        "service list",
+        "list services",
+        "what services",
+        "available services",
+        "what can you do",
+        "what do you do",
+        "الخدمات",
+        "خدماتك",
+        "الخدمه",
+        "الخدمة",
+        "بتعمل ايه",
+        "تقدر تعمل ايه",
+    ]
+    return any(keyword in value for keyword in keywords)
+
+
+def _services_response(text: str) -> str:
+    services = _services_from_context()
+    if _is_arabic_text(text):
+        if not services:
+            return "حالياً لا توجد خدمات مضافة للمساعد."
+        header = "الخدمات المتاحة حالياً:"
+    else:
+        if not services:
+            return "No services are configured yet."
+        header = "Available services:"
+    lines = [header]
+    for idx, service in enumerate(services, start=1):
+        lines.append(f"- Option {idx}: {service}")
+    return "\n".join(lines)
+
+def _invoke_graph(graph: Any, messages: list[Any]) -> list[Any]:
+    try:
+        _write_action_log(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": "graph_invoke",
+                "device_id": _get_device_id(),
+                "agent": AGENT_CONTEXT.get("name"),
+                "messages_count": len(messages),
+            }
+        )
+        result = graph.invoke(
+            {"messages": messages},
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+    except Exception as exc:
+        if "recursion limit" in str(exc).lower():
+            return messages + [
+                AIMessage(
+                    content=(
+                        "I couldn't complete that action because the integration kept failing. "
+                        "Please verify the integration credentials and try again."
+                    )
+                )
+            ]
+        raise
+    return result["messages"]
+
+
+class _StreamingHandler(BaseCallbackHandler):
+    def __init__(self, token_queue: "queue.Queue[str]") -> None:
+        self.token_queue = token_queue
+
+    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
+        if token:
+            self.token_queue.put(token)
+
+
+def _stream_graph_output(messages: list[Any], system_override: str | None = None) -> Any:
+    global LAST_OUTPUT
+    token_queue: "queue.Queue[str | None]" = queue.Queue()
+    output_holder: dict[str, Any] = {"output": "", "error": None}
+    handler = _StreamingHandler(token_queue)
+    last_user_text = ""
+    for item in reversed(messages):
+        if isinstance(item, HumanMessage):
+            last_user_text = str(getattr(item, "content", "") or "")
+            break
+    system_override = _system_prompt_for_user_input(last_user_text, system_override)
+    graph = _build_graph(
+        system_prompt_override=system_override,
+        callbacks=[handler],
+        streaming=True,
+    )
+
+    def worker() -> None:
+        try:
+            result_messages = _invoke_graph(graph, messages)
+            output_holder["output"] = _extract_response(result_messages)
+        except Exception as exc:
+            output_holder["error"] = str(exc)
+        finally:
+            LAST_OUTPUT = output_holder["output"]
+            token_queue.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    emitted = False
+    while True:
+        token = token_queue.get()
+        if token is None:
+            break
+        emitted = True
+        yield token
+
+    if output_holder["error"]:
+        raise RuntimeError(output_holder["error"])
+    if not emitted and output_holder["output"]:
+        yield output_holder["output"]
+
+
+def run(user_input: str) -> str:
+    _log_user_prompt(user_input)
+    skip_auto = _is_option_selection(user_input)
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    auto_result = _auto_postman_get(user_input, [], flow_text) if not skip_auto else ""
+    if auto_result:
+        _log_assistant_reply(auto_result)
+        return auto_result
+    flow_result = _auto_postman_from_flow([], user_input)
+    if flow_result:
+        _log_assistant_reply(flow_result)
+        return flow_result
+    intent_text = _intent_context(user_input)
+    if _is_services_request(intent_text):
+        output = _services_response(intent_text)
+        _log_assistant_reply(output)
+        return output
+    design_active = _design_enabled()
+    intent = _classify_intent(intent_text)
+    if design_active:
+        if not intent.get("generate_images") and _selection_implies_images([], user_input):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and (_branding_prompted([]) or _style_prompted([])):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and _style_selected([], user_input):
+            intent["generate_images"] = True
+        if _llm_style_specified(user_input):
+            intent["generate_images"] = True
+            intent["needs_design_details"] = False
+    if intent.get("send_to_whatsapp"):
+        intent["needs_design_details"] = False
+        intent["needs_brand_choice"] = False
+    if design_active:
+        if intent.get("needs_design_details") and _style_selected([], user_input):
+            intent["needs_design_details"] = False
+        if intent.get("needs_design_details") and _llm_style_specified(user_input):
+            intent["needs_design_details"] = False
+        if intent.get("generate_images") and not intent.get("needs_design_details"):
+            if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+                intent["needs_design_details"] = True
+            intent["generate_images"] = True
+        if intent.get("generate_images") and not intent.get("needs_design_details"):
+            if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+                intent["needs_design_details"] = True
+    if (
+        not intent.get("send_to_whatsapp")
+        and _whatsapp_owner_phone()
+        and _llm_send_requested([], user_input)
+    ):
+        intent["send_to_whatsapp"] = True
+    if _llm_send_requested([], user_input) and not _whatsapp_owner_phone():
+        output = "WhatsApp integration is not connected. Please add the WhatsApp integration or configure the owner phone."
+        if _is_arabic_text(intent_text):
+            output = "تكامل واتساب غير متصل حالياً. يرجى إضافة تكامل واتساب أو ضبط رقم مالك الحساب."
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("needs_brand_choice"):
+        _apply_brand_choice(intent, user_input)
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        if (_branding_prompted([]) or _style_prompted([])) and not _style_selected([], user_input):
+            output = _style_choice_question()
+            _log_assistant_reply(output)
+            return output
+    if design_active and intent.get("needs_design_details") and _llm_style_specified(user_input):
+        intent["needs_design_details"] = False
+    if design_active and intent.get("generate_images") and not intent.get("needs_design_details"):
+        if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+            intent["needs_design_details"] = True
+        intent["generate_images"] = True
+    if design_active and intent.get("needs_design_details"):
+        output = _design_followup_question(intent_text, intent)
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("generate_images") and intent.get("needs_brand_choice") and _has_brand_profile():
+        output = _brand_choice_question(intent_text)
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        prompt_text = _build_image_prompt(intent_text, intent)
+        generated = _image_generate(prompt_text, 1)
+        output = _append_generated_image(str(generated), prompt_text, intent_text)
+        _log_assistant_reply(output)
+        return output
+    graph = _build_graph(system_prompt_override=_system_prompt_for_user_input(user_input))
+    history: list[Any] = []
+    history_messages: list[dict[str, str]] = []
+    if _needs_owner_phone_hint(intent_text):
+        hint = _owner_phone_hint()
+        if hint:
+            history.append(hint)
+    history.append(HumanMessage(content=user_input))
+    messages = _invoke_graph(graph, history)
+    output = _extract_response(messages)
+    followup = _maybe_followup_from_selection([], user_input)
+    if followup:
+        _log_assistant_reply(followup)
+        return followup
+    if intent.get("send_to_whatsapp") and _whatsapp_owner_phone():
+        urls = _extract_image_urls(output)
+        if not urls:
+            history_urls = _recent_image_urls(history_messages)
+            if history_urls:
+                output = (output.strip() + "\n" + "\n".join(history_urls)).strip()
+                urls = history_urls
+            else:
+                prompt = _llm_image_prompt_for_send(history_messages, user_input)
+                if prompt:
+                    generated = _image_generate(prompt, 1)
+                    urls = _extract_image_urls(str(generated))
+                    if urls:
+                        intent["generate_images"] = True
+                        output = (output.strip() + "\n" + "\n".join(urls)).strip()
+        delivered = _send_marketing_to_owner(output, intent_text, intent)
+        if delivered:
+            suffix = "Sent to your WhatsApp. Please check your phone."
+            if _is_arabic_text(intent_text):
+                suffix = "تم الإرسال إلى واتساب. يرجى التحقق من هاتفك."
+            if output.strip():
+                final_output = f"{output}\n\n{suffix}".strip()
+                _log_assistant_reply(final_output)
+                return final_output
+            _log_assistant_reply(suffix)
+            return suffix
+    _log_assistant_reply(output)
+    return output
+
+
+def run_with_history(messages: list[dict[str, str]], user_input: str) -> str:
+    _log_user_prompt(user_input, messages)
+    history = []
+    for item in messages:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role == "system":
+            history.append(SystemMessage(content=content))
+        elif role == "assistant":
+            history.append(AIMessage(content=content))
+        elif role == "user":
+            history.append(HumanMessage(content=content))
+    analysis_text = _extract_image_analysis_from_messages(messages)
+    options = _extract_last_options(messages)
+    is_option_selection = bool(options) and _llm_is_option_selection(options, user_input)
+    if is_option_selection and _options_are_services(options):
+        idx = _resolve_selection_index_llm(options, user_input)
+        if idx is not None and 0 <= idx < len(options):
+            user_input = options[idx]
+    if is_option_selection and not _options_are_services(options):
+        followup = _maybe_followup_from_selection(messages, user_input)
+        if followup:
+            _log_assistant_reply(followup)
+            return followup
+        fallback = "Please choose one of the listed options."
+        if _is_arabic_text(user_input):
+            fallback = "من فضلك اختر أحد الخيارات المذكورة."
+        _log_assistant_reply(fallback)
+        return fallback
+    skip_auto = is_option_selection
+    if not skip_auto and options and _options_are_services(options):
+        skip_auto = True
+    if not skip_auto:
+        services = _services_from_context()
+        if services and any(str(user_input).strip().lower() == s.lower() for s in services):
+            skip_auto = True
+    if not messages and _llm_is_greeting(user_input):
+        services = _services_from_context()
+        if services:
+            output = _services_response(user_input)
+            _log_assistant_reply(output)
+            return output
+    if analysis_text and _is_image_analysis_request(user_input):
+        _log_assistant_reply(analysis_text)
+        return analysis_text
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    services = _services_from_context()
+    if services and any(str(user_input).strip().lower() == s.lower() for s in services):
+        missing_question = _llm_missing_flow_fields(messages, flow_text, str(user_input))
+        if missing_question:
+            _log_assistant_reply(missing_question)
+            return missing_question
+    auto_result = _auto_postman_get(user_input, messages, flow_text) if not skip_auto else ""
+    if auto_result:
+        _log_assistant_reply(auto_result)
+        return auto_result
+    flow_result = _auto_postman_from_flow(messages, user_input) if not skip_auto else ""
+    if flow_result:
+        _log_assistant_reply(flow_result)
+        return flow_result
+    if _needs_owner_phone_hint(user_input):
+        hint = _owner_phone_hint()
+        if hint:
+            history.insert(0, hint)
+    system_override = None
+    for item in messages:
+        if item.get("role") == "system" and "NO_WHATSAPP_TOOLS" in (item.get("content") or ""):
+            system_override = item.get("content") or None
+            break
+    if not history:
+        history = [HumanMessage(content=user_input)]
+    intent_text = _intent_context(user_input, messages)
+    if _is_services_request(intent_text):
+        output = _services_response(intent_text)
+        _log_assistant_reply(output)
+        return output
+    design_active = _design_enabled()
+    intent = _classify_intent(intent_text)
+    if design_active:
+        if not intent.get("generate_images") and _selection_implies_images([], user_input):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and (_branding_prompted([]) or _style_prompted([])):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and _style_selected([], user_input):
+            intent["generate_images"] = True
+        if _llm_style_specified(user_input):
+            intent["generate_images"] = True
+            intent["needs_design_details"] = False
+    if intent.get("send_to_whatsapp"):
+        intent["needs_design_details"] = False
+        intent["needs_brand_choice"] = False
+    if design_active:
+        if intent.get("needs_design_details") and _style_selected([], user_input):
+            intent["needs_design_details"] = False
+        if intent.get("needs_design_details") and _llm_style_specified(user_input):
+            intent["needs_design_details"] = False
+        if intent.get("generate_images") and not intent.get("needs_design_details"):
+            if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+                intent["needs_design_details"] = True
+            intent["generate_images"] = True
+    if (
+        not intent.get("send_to_whatsapp")
+        and _whatsapp_owner_phone()
+        and _llm_send_requested(messages, user_input)
+    ):
+        intent["send_to_whatsapp"] = True
+    if _llm_send_requested(messages, user_input) and not _whatsapp_owner_phone():
+        output = "WhatsApp integration is not connected. Please add the WhatsApp integration or configure the owner phone."
+        if _is_arabic_text(intent_text):
+            output = "تكامل واتساب غير متصل حالياً. يرجى إضافة تكامل واتساب أو ضبط رقم مالك الحساب."
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("needs_brand_choice"):
+        _apply_brand_choice(intent, user_input)
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        if _branding_prompted(messages) and not _style_selected([], user_input):
+            output = _style_choice_question()
+            _log_assistant_reply(output)
+            return output
+    if design_active and intent.get("needs_design_details") and _llm_style_specified(user_input):
+        intent["needs_design_details"] = False
+        intent["generate_images"] = True
+    if design_active and intent.get("generate_images") and not intent.get("needs_design_details"):
+        if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+            intent["needs_design_details"] = True
+    if design_active and intent.get("needs_design_details"):
+        output = _design_followup_question(intent_text, intent)
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("generate_images") and intent.get("needs_brand_choice") and _has_brand_profile():
+        output = _brand_choice_question(intent_text)
+        _log_assistant_reply(output)
+        return output
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        prompt_text = _build_image_prompt(intent_text, intent)
+        generated = _image_generate(prompt_text, 1)
+        output = _append_generated_image(str(generated), prompt_text, intent_text)
+        _log_assistant_reply(output)
+        return output
+    history_messages = messages
+    graph = _build_graph(system_prompt_override=_system_prompt_for_user_input(user_input, system_override))
+    messages = _invoke_graph(graph, history)
+    output = _extract_response(messages)
+    followup = _maybe_followup_from_selection(history_messages, user_input)
+    if followup:
+        _log_assistant_reply(followup)
+        return followup
+    if intent.get("send_to_whatsapp") and _whatsapp_owner_phone():
+        if not _extract_image_urls(output):
+            history_urls = _recent_image_urls(history_messages)
+            if history_urls:
+                output = (output.strip() + "\n" + "\n".join(history_urls)).strip()
+            else:
+                prompt = _llm_image_prompt_for_send(history_messages, user_input)
+                if prompt:
+                    generated = _image_generate(prompt, 1)
+                    urls = _extract_image_urls(str(generated))
+                    if urls:
+                        intent["generate_images"] = True
+                        output = (output.strip() + "\n" + "\n".join(urls)).strip()
+        delivered = _send_marketing_to_owner(output, intent_text, intent)
+        if delivered:
+            suffix = "Sent to your WhatsApp. Please check your phone."
+            if _is_arabic_text(intent_text):
+                suffix = "تم الإرسال إلى واتساب. يرجى التحقق من هاتفك."
+            if output.strip():
+                final_output = f"{output}\n\n{suffix}".strip()
+                _log_assistant_reply(final_output)
+                return final_output
+            _log_assistant_reply(suffix)
+            return suffix
+    _log_assistant_reply(output)
+    return output
+
+
+def run_stream(user_input: str) -> Any:
+    global LAST_OUTPUT
+    LAST_OUTPUT = ""
+    _log_user_prompt(user_input)
+    messages = []
+    skip_auto = _is_option_selection(user_input)
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    auto_result = _auto_postman_get(user_input, [], flow_text) if not skip_auto else ""
+    if auto_result:
+        LAST_OUTPUT = auto_result
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    flow_result = _auto_postman_from_flow([], user_input)
+    if flow_result:
+        LAST_OUTPUT = flow_result
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    intent_text = _intent_context(user_input)
+    if _is_services_request(intent_text):
+        LAST_OUTPUT = _services_response(intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    design_active = _design_enabled()
+    intent = _classify_intent(intent_text)
+    if design_active:
+        if not intent.get("generate_images") and _selection_implies_images(messages, user_input):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and (_branding_prompted(messages) or _style_prompted(messages)):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and _style_selected([], user_input):
+            intent["generate_images"] = True
+        if _llm_style_specified(user_input):
+            intent["generate_images"] = True
+            intent["needs_design_details"] = False
+    if intent.get("send_to_whatsapp"):
+        intent["needs_design_details"] = False
+        intent["needs_brand_choice"] = False
+    if design_active:
+        if intent.get("needs_design_details") and _style_selected([], user_input):
+            intent["needs_design_details"] = False
+        if intent.get("needs_design_details") and _llm_style_specified(user_input):
+            intent["needs_design_details"] = False
+            intent["generate_images"] = True
+        if intent.get("generate_images") and not intent.get("needs_design_details"):
+            if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+                intent["needs_design_details"] = True
+    if (
+        not intent.get("send_to_whatsapp")
+        and _whatsapp_owner_phone()
+        and _llm_send_requested(messages, user_input)
+    ):
+        intent["send_to_whatsapp"] = True
+    if _llm_send_requested(messages, user_input) and not _whatsapp_owner_phone():
+        output = "WhatsApp integration is not connected. Please add the WhatsApp integration or configure the owner phone."
+        if _is_arabic_text(intent_text):
+            output = "تكامل واتساب غير متصل حالياً. يرجى إضافة تكامل واتساب أو ضبط رقم مالك الحساب."
+        _log_assistant_reply(output)
+        yield output
+        return
+    if design_active and intent.get("needs_brand_choice"):
+        _apply_brand_choice(intent, user_input)
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        if (_branding_prompted(messages) or _style_prompted(messages)) and not _style_selected([], user_input):
+            LAST_OUTPUT = _style_choice_question()
+            _log_assistant_reply(LAST_OUTPUT)
+            yield LAST_OUTPUT
+            return
+    if design_active and intent.get("needs_design_details") and _llm_style_specified(user_input):
+        intent["needs_design_details"] = False
+        intent["generate_images"] = True
+    if design_active and intent.get("generate_images") and not intent.get("needs_design_details"):
+        if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+            intent["needs_design_details"] = True
+    if design_active and intent.get("needs_design_details"):
+        LAST_OUTPUT = _design_followup_question(intent_text, intent)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if design_active and intent.get("generate_images") and intent.get("needs_brand_choice") and _has_brand_profile():
+        LAST_OUTPUT = _brand_choice_question(intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    history: list[Any] = []
+    if _needs_owner_phone_hint(intent_text):
+        hint = _owner_phone_hint()
+        if hint:
+            history.append(hint)
+    history.append(HumanMessage(content=user_input))
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        wait_msg = _design_wait_message(intent_text)
+        if wait_msg:
+            _log_assistant_reply(wait_msg)
+            yield wait_msg
+        prompt_text = _build_image_prompt(intent_text, intent)
+        generated = _image_generate(prompt_text, 1)
+        LAST_OUTPUT = _append_generated_image(str(generated), prompt_text, intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    yield from _stream_graph_output(history)
+    followup = _maybe_followup_from_selection([], user_input)
+    if followup:
+        LAST_OUTPUT = followup
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if intent.get("send_to_whatsapp") and _whatsapp_owner_phone():
+        if not _extract_image_urls(LAST_OUTPUT):
+            history_urls = _recent_image_urls([], limit=3)
+            if history_urls:
+                LAST_OUTPUT = (LAST_OUTPUT.strip() + "\n" + "\n".join(history_urls)).strip()
+            else:
+                prompt = _llm_image_prompt_for_send(messages, user_input)
+                if prompt:
+                    generated = _image_generate(prompt, 1)
+                    urls = _extract_image_urls(str(generated))
+                    if urls:
+                        intent["generate_images"] = True
+                        LAST_OUTPUT = (LAST_OUTPUT.strip() + "\n" + "\n".join(urls)).strip()
+        delivered = _send_marketing_to_owner(LAST_OUTPUT, intent_text, intent)
+        if delivered:
+            suffix = "Sent to your WhatsApp. Please check your phone."
+            if _is_arabic_text(intent_text):
+                suffix = "تم الإرسال إلى واتساب. يرجى التحقق من هاتفك."
+            LAST_OUTPUT = f"{LAST_OUTPUT}\n\n{suffix}".strip()
+            _log_assistant_reply(LAST_OUTPUT)
+            yield f"\n\n{suffix}"
+            return
+    _log_assistant_reply(LAST_OUTPUT)
+
+
+def run_with_history_stream(messages: list[dict[str, str]], user_input: str) -> Any:
+    global LAST_OUTPUT
+    LAST_OUTPUT = ""
+    _log_user_prompt(user_input, messages)
+    history = []
+    for item in messages:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role == "system":
+            history.append(SystemMessage(content=content))
+        elif role == "assistant":
+            history.append(AIMessage(content=content))
+        elif role == "user":
+            history.append(HumanMessage(content=content))
+    analysis_text = _extract_image_analysis_from_messages(messages)
+    options = _extract_last_options(messages)
+    if options:
+        followup = _maybe_followup_from_selection(messages, user_input)
+        if followup:
+            _log_assistant_reply(followup)
+            return followup
+    skip_auto = bool(options) and _llm_is_option_selection(options, user_input)
+    if not skip_auto and options and _options_are_services(options):
+        skip_auto = True
+    if analysis_text and _is_image_analysis_request(user_input):
+        LAST_OUTPUT = analysis_text
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    flow_text = str(AGENT_CONTEXT.get("flow") or "")
+    auto_result = _auto_postman_get(user_input, messages, flow_text) if not skip_auto else ""
+    if auto_result:
+        LAST_OUTPUT = auto_result
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    flow_result = _auto_postman_from_flow(messages, user_input) if not skip_auto else ""
+    if flow_result:
+        LAST_OUTPUT = flow_result
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if _needs_owner_phone_hint(user_input):
+        hint = _owner_phone_hint()
+        if hint:
+            history.insert(0, hint)
+    system_override = None
+    for item in messages:
+        if item.get("role") == "system" and "NO_WHATSAPP_TOOLS" in (item.get("content") or ""):
+            system_override = item.get("content") or None
+            break
+    if not history:
+        history = [HumanMessage(content=user_input)]
+    intent_text = _intent_context(user_input, messages)
+    if _is_services_request(intent_text):
+        LAST_OUTPUT = _services_response(intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    design_active = _design_enabled()
+    intent = _classify_intent(intent_text)
+    if design_active:
+        if not intent.get("generate_images") and _selection_implies_images(messages, user_input):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and (_branding_prompted(messages) or _style_prompted(messages)):
+            intent["generate_images"] = True
+        if not intent.get("generate_images") and _style_selected([], user_input):
+            intent["generate_images"] = True
+        if _llm_style_specified(user_input):
+            intent["generate_images"] = True
+            intent["needs_design_details"] = False
+    if intent.get("send_to_whatsapp"):
+        intent["needs_design_details"] = False
+        intent["needs_brand_choice"] = False
+    if design_active:
+        if intent.get("needs_design_details") and _style_selected([], user_input):
+            intent["needs_design_details"] = False
+        if intent.get("needs_design_details") and _llm_style_specified(user_input):
+            intent["needs_design_details"] = False
+            intent["generate_images"] = True
+        if intent.get("generate_images") and not intent.get("needs_design_details"):
+            if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+                intent["needs_design_details"] = True
+    if (
+        not intent.get("send_to_whatsapp")
+        and _whatsapp_owner_phone()
+        and _llm_send_requested(messages, user_input)
+    ):
+        intent["send_to_whatsapp"] = True
+    if _llm_send_requested(messages, user_input) and not _whatsapp_owner_phone():
+        output = "WhatsApp integration is not connected. Please add the WhatsApp integration or configure the owner phone."
+        if _is_arabic_text(intent_text):
+            output = "تكامل واتساب غير متصل حالياً. يرجى إضافة تكامل واتساب أو ضبط رقم مالك الحساب."
+        _log_assistant_reply(output)
+        yield output
+        return
+    if design_active and intent.get("needs_brand_choice"):
+        _apply_brand_choice(intent, user_input)
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        if (_branding_prompted(messages) or _style_prompted(messages)) and not _style_selected([], user_input):
+            LAST_OUTPUT = _style_choice_question()
+            _log_assistant_reply(LAST_OUTPUT)
+            yield LAST_OUTPUT
+            return
+    if design_active and intent.get("needs_design_details") and _llm_style_specified(user_input):
+        intent["needs_design_details"] = False
+        intent["generate_images"] = True
+    if design_active and intent.get("generate_images") and not intent.get("needs_design_details"):
+        if not _llm_style_specified(user_input) and not _style_selected([], user_input):
+            intent["needs_design_details"] = True
+    if design_active and intent.get("needs_design_details"):
+        LAST_OUTPUT = _design_followup_question(intent_text, intent)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if design_active and intent.get("generate_images") and intent.get("needs_brand_choice") and _has_brand_profile():
+        LAST_OUTPUT = _brand_choice_question(intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if design_active and intent.get("generate_images") and not intent.get("send_to_whatsapp"):
+        prompt_text = _build_image_prompt(intent_text, intent)
+        generated = _image_generate(prompt_text, 1)
+        LAST_OUTPUT = _append_generated_image(str(generated), prompt_text, intent_text)
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    yield from _stream_graph_output(history, system_override)
+    followup = _maybe_followup_from_selection(messages, user_input)
+    if followup:
+        LAST_OUTPUT = followup
+        _log_assistant_reply(LAST_OUTPUT)
+        yield LAST_OUTPUT
+        return
+    if intent.get("send_to_whatsapp") and _whatsapp_owner_phone():
+        urls = _extract_image_urls(LAST_OUTPUT)
+        if not urls:
+            history_urls = _recent_image_urls(messages)
+            if history_urls:
+                LAST_OUTPUT = (LAST_OUTPUT.strip() + "\n" + "\n".join(history_urls)).strip()
+                urls = history_urls
+            else:
+                prompt = _llm_image_prompt_for_send(messages, user_input)
+                if prompt:
+                    generated = _image_generate(prompt, 1)
+                    urls = _extract_image_urls(str(generated))
+                    if urls:
+                        intent["generate_images"] = True
+                        LAST_OUTPUT = (LAST_OUTPUT.strip() + "\n" + "\n".join(urls)).strip()
+        delivered = _send_marketing_to_owner(LAST_OUTPUT, intent_text, intent)
+        if delivered:
+            suffix = "Sent to your WhatsApp. Please check your phone."
+            if _is_arabic_text(intent_text):
+                suffix = "تم الإرسال إلى واتساب. يرجى التحقق من هاتفك."
+            LAST_OUTPUT = f"{LAST_OUTPUT}\n\n{suffix}".strip()
+            _log_assistant_reply(LAST_OUTPUT)
+            yield f"\n\n{suffix}"
+            return
+    _log_assistant_reply(LAST_OUTPUT)
