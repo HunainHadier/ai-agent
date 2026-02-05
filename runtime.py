@@ -647,19 +647,24 @@ def _parse_query_placeholders(url: str) -> list[str]:
 def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, selected: str) -> str | None:
     if not keys:
         return None
-    if len(keys) == 1:
-        return keys[0]
+    system_params = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    selectable_keys = [k for k in keys if str(k).strip().lower() not in system_params]
+    if not selectable_keys:
+        return None
+    if len(selectable_keys) == 1:
+        return selectable_keys[0]
     client = _selection_client()
     if client is None:
-        return max(keys, key=len)
+        return max(selectable_keys, key=len)
     prompt = (
         "Choose which query parameter should receive the selected value. "
+        "NEVER choose 'db', 'token', 'auth', 'api_key', 'key', 'lang', 'locale', 'device', or 'device_id'. "
         "Prefer keys that represent the user's selection. "
         "Reply only with the parameter key, or 'none' if unsure."
     )
     user_text = (
         f"Endpoint: {endpoint_name}\nFlow: {flow_text}\n"
-        f"Keys: {', '.join(keys)}\nSelected: {selected}"
+        f"Keys: {', '.join(selectable_keys)}\nSelected: {selected}"
     )
     try:
         response = client.chat.completions.create(
@@ -672,16 +677,16 @@ def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, s
             max_tokens=5,
         )
     except Exception:
-        return max(keys, key=len)
+        return max(selectable_keys, key=len)
     content = ""
     try:
         content = response.choices[0].message.content or ""
     except Exception:
         content = ""
     choice = content.strip().split()[0] if content else ""
-    if choice in keys:
+    if choice in selectable_keys:
         return choice
-    return max(keys, key=len)
+    return max(selectable_keys, key=len)
 
 
 def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, selected: str) -> dict[str, str] | None:
@@ -689,6 +694,9 @@ def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, sel
     if not keys or not selected:
         return None
     key = _pick_query_param_key(keys, endpoint_name, flow_text, selected)
+    ignored_keys = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    if key and str(key).strip().lower() in ignored_keys:
+        key = None
     if not key:
         return None
     return {key: selected}

@@ -698,8 +698,6 @@ def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, s
 def _fallback_query_key(keys: list[str]) -> str | None:
     if not keys:
         return None
-    if len(keys) == 1:
-        return keys[0]
     ignore = {
         "db",
         "device_id",
