@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import re
+from datetime import date
 from typing import Any, Iterable
 
 from openai import OpenAI
@@ -71,6 +72,67 @@ def _serialize_messages(messages: list[dict[str, str]] | None, limit: int = 6) -
             continue
         trimmed.append({"role": role or "user", "content": content})
     return trimmed
+
+
+def _is_arabic_text(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"[\\u0600-\\u06FF]", text))
+
+
+def _parse_iso_date(value: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _iter_body_date_fields(payload: Any) -> Iterable[tuple[str, str]]:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if isinstance(value, (dict, list)):
+                yield from _iter_body_date_fields(value)
+            elif isinstance(value, str):
+                yield str(key), value
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from _iter_body_date_fields(item)
+
+
+def _body_needs_fresh_dates(body: dict[str, Any]) -> bool:
+    today = date.today()
+    date_keys = ("check", "date", "arrival", "departure")
+    for key, value in _iter_body_date_fields(body):
+        key_lower = key.lower()
+        if not any(token in key_lower for token in date_keys):
+            continue
+        if not value or "{{" in value:
+            return True
+        parsed = _parse_iso_date(value)
+        if parsed and parsed < today:
+            return True
+    return False
+
+
+def _apply_date_values(body: dict[str, Any], values: dict[str, str]) -> None:
+    if not body or not values:
+        return
+    date_start = values.get("date_start")
+    date_end = values.get("date_end")
+    if not date_start and not date_end:
+        return
+    for key, value in body.items():
+        if not isinstance(key, str):
+            continue
+        key_lower = key.lower()
+        if date_start and any(token in key_lower for token in ("check_in", "checkin", "date_start", "arrival")):
+            if value in (None, "", 0) or (isinstance(value, str) and "{{" in value):
+                body[key] = date_start
+        if date_end and any(token in key_lower for token in ("check_out", "checkout", "date_end", "departure")):
+            if value in (None, "", 0) or (isinstance(value, str) and "{{" in value):
+                body[key] = date_end
 
 
 def _llm_select_endpoint(
@@ -585,19 +647,24 @@ def _parse_query_placeholders(url: str) -> list[str]:
 def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, selected: str) -> str | None:
     if not keys:
         return None
-    if len(keys) == 1:
-        return keys[0]
+    system_params = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    selectable_keys = [k for k in keys if str(k).strip().lower() not in system_params]
+    if not selectable_keys:
+        return None
+    if len(selectable_keys) == 1:
+        return selectable_keys[0]
     client = _selection_client()
     if client is None:
-        return max(keys, key=len)
+        return max(selectable_keys, key=len)
     prompt = (
         "Choose which query parameter should receive the selected value. "
+        "NEVER choose 'db', 'token', 'auth', 'api_key', 'key', 'lang', 'locale', 'device', or 'device_id'. "
         "Prefer keys that represent the user's selection. "
         "Reply only with the parameter key, or 'none' if unsure."
     )
     user_text = (
         f"Endpoint: {endpoint_name}\nFlow: {flow_text}\n"
-        f"Keys: {', '.join(keys)}\nSelected: {selected}"
+        f"Keys: {', '.join(selectable_keys)}\nSelected: {selected}"
     )
     try:
         response = client.chat.completions.create(
@@ -610,16 +677,16 @@ def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, s
             max_tokens=5,
         )
     except Exception:
-        return max(keys, key=len)
+        return max(selectable_keys, key=len)
     content = ""
     try:
         content = response.choices[0].message.content or ""
     except Exception:
         content = ""
     choice = content.strip().split()[0] if content else ""
-    if choice in keys:
+    if choice in selectable_keys:
         return choice
-    return max(keys, key=len)
+    return max(selectable_keys, key=len)
 
 
 def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, selected: str) -> dict[str, str] | None:
@@ -627,6 +694,9 @@ def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, sel
     if not keys or not selected:
         return None
     key = _pick_query_param_key(keys, endpoint_name, flow_text, selected)
+    ignored_keys = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    if key and str(key).strip().lower() in ignored_keys:
+        key = None
     if not key:
         return None
     return {key: selected}
@@ -1033,6 +1103,11 @@ def _auto_postman_from_flow_selection(module: Any, messages: list[dict[str, str]
             current = body.get(key)
             if current in (None, "", 0) or (isinstance(current, str) and "{{" in current):
                 body[key] = value
+        _apply_date_values(body, values)
+        if not (values.get("date_start") and values.get("date_end")) and _body_needs_fresh_dates(body):
+            if _is_arabic_text(user_input):
+                return "من فضلك أدخل تاريخي تسجيل الوصول والمغادرة بصيغة YYYY-MM-DD (مثال: 2025-12-24 و 2025-12-30)."
+            return "Please provide the check-in and check-out dates in YYYY-MM-DD format (e.g., 2025-12-24 and 2025-12-30)."
         target_container = body
         if isinstance(body.get("lines"), list):
             lines = body.get("lines") or []
