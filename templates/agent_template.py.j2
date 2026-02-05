@@ -142,6 +142,8 @@ def _format_context() -> str:
         "For any list or prompt, output each option on its own line in the format: '- Option N: Value'.",
         "Do not invent data for steps backed by integrations. Use Postman endpoints described by the flow.",
         "Follow the flow order: after presenting options, wait for a selection, then call the next relevant endpoint if configured.",
+        "If you already showed the same options and the user repeats the same selection, do not re-fetch the same options. Instead, move to the next step or ask for the missing required fields.",
+        "When required fields are missing for the next step, ask for them directly before calling any endpoint.",
         "If any Postman call fails, respond with the HTTP status and offer to show logs via get_request_logs.",
         "Never rewrite user-provided dates; pass the exact YYYY-MM-DD values the user gives.",
         "For general questions (like hotel info or policies), always call rag_search first and answer using its results.",
@@ -1297,8 +1299,6 @@ def _pick_query_param_key(keys: list[str], endpoint_name: str, flow_text: str, s
 def _fallback_query_key(keys: list[str]) -> str | None:
     if not keys:
         return None
-    if len(keys) == 1:
-        return keys[0]
     ignore = {
         "db",
         "device_id",
