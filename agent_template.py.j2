@@ -1300,6 +1300,9 @@ def _build_query_for_selection(url: str, endpoint_name: str, flow_text: str, sel
     if not keys or not selected:
         return None
     key = _pick_query_param_key(keys, endpoint_name, flow_text, selected)
+    ignored_keys = {"db", "device_id", "device", "token", "auth", "api_key", "key", "lang", "locale"}
+    if key and str(key).strip().lower() in ignored_keys:
+        key = None
     if not key:
         key = _fallback_query_key(keys)
     if not key:
